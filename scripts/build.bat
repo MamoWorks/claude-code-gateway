@@ -1,5 +1,5 @@
 @echo off
-REM Build cc2api: frontend + Rust backend (win/linux-amd64/linux-arm64)
+REM Build claude-code-gateway: frontend + Rust backend (win/linux-amd64/linux-arm64)
 REM Frontend is embedded into the binary at compile time.
 REM Requires: zig, cargo-zigbuild (for Linux cross-compilation)
 REM Usage: build.bat [target]
@@ -13,7 +13,7 @@ set "TARGET=%~1"
 if "%TARGET%"=="" set "TARGET=all"
 set "OUTPUT_DIR=%CD%\dist"
 
-echo === cc2api build ===
+echo === claude-code-gateway build ===
 
 REM 1. Clean previous build
 echo Cleaning previous build...
@@ -65,7 +65,7 @@ if "%TARGET%"=="all" (
 echo.
 echo === Build complete ===
 echo Output: %OUTPUT_DIR%\
-dir /b "%OUTPUT_DIR%\cc2api-*" 2>nul
+dir /b "%OUTPUT_DIR%\claude-code-gateway-*" 2>nul
 
 popd
 exit /b 0
@@ -74,9 +74,9 @@ exit /b 0
 echo.
 echo --- Building win-amd64 (native) ---
 cargo build --release
-if exist "target\release\cc2api.exe" (
-    copy "target\release\cc2api.exe" "%OUTPUT_DIR%\cc2api-win-amd64.exe"
-    echo OK: cc2api-win-amd64.exe
+if exist "target\release\claude-code-gateway.exe" (
+    copy "target\release\claude-code-gateway.exe" "%OUTPUT_DIR%\claude-code-gateway-win-amd64.exe"
+    echo OK: claude-code-gateway-win-amd64.exe
 ) else (
     echo FAILED: win-amd64
 )
@@ -87,9 +87,9 @@ echo.
 echo --- Building linux-amd64 (zigbuild) ---
 rustup target add x86_64-unknown-linux-gnu >nul 2>&1
 cargo zigbuild --release --target x86_64-unknown-linux-gnu
-if exist "target\x86_64-unknown-linux-gnu\release\cc2api" (
-    copy "target\x86_64-unknown-linux-gnu\release\cc2api" "%OUTPUT_DIR%\cc2api-linux-amd64"
-    echo OK: cc2api-linux-amd64
+if exist "target\x86_64-unknown-linux-gnu\release\claude-code-gateway" (
+    copy "target\x86_64-unknown-linux-gnu\release\claude-code-gateway" "%OUTPUT_DIR%\claude-code-gateway-linux-amd64"
+    echo OK: claude-code-gateway-linux-amd64
 ) else (
     echo FAILED: linux-amd64
 )
@@ -100,9 +100,9 @@ echo.
 echo --- Building linux-arm64 (zigbuild) ---
 rustup target add aarch64-unknown-linux-gnu >nul 2>&1
 cargo zigbuild --release --target aarch64-unknown-linux-gnu
-if exist "target\aarch64-unknown-linux-gnu\release\cc2api" (
-    copy "target\aarch64-unknown-linux-gnu\release\cc2api" "%OUTPUT_DIR%\cc2api-linux-arm64"
-    echo OK: cc2api-linux-arm64
+if exist "target\aarch64-unknown-linux-gnu\release\claude-code-gateway" (
+    copy "target\aarch64-unknown-linux-gnu\release\claude-code-gateway" "%OUTPUT_DIR%\claude-code-gateway-linux-arm64"
+    echo OK: claude-code-gateway-linux-arm64
 ) else (
     echo FAILED: linux-arm64
 )

@@ -1,14 +1,12 @@
 services:
-  cc2api:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
+  claude-code-gateway:
+    image: ghcr.io/mamoworks/claude-code-gateway:latest
     ports:
       - "${SERVER_PORT:-5674}:5674"
     env_file:
       - ../.env
     volumes:
-      - cc2api-data:/app/data
+      - claude-code-gateway-data:/app/data
     restart: unless-stopped
 
   # Optional: Redis for multi-instance deployments
@@ -20,5 +18,5 @@ services:
   #     - redis-data:/data
 
 volumes:
-  cc2api-data:
+  claude-code-gateway-data:
   # redis-data:

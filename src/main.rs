@@ -85,9 +85,9 @@ async fn main() {
 
     let addr = format!("{}:{}", cfg.server.host, cfg.server.port);
     if cfg.server.tls_cert.is_some() {
-        info!("cc2api listening on https://{}", addr);
+        info!("claude-code-gateway listening on https://{}", addr);
     } else {
-        info!("cc2api listening on http://{}", addr);
+        info!("claude-code-gateway listening on http://{}", addr);
     }
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();

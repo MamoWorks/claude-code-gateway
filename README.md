@@ -1,6 +1,6 @@
 # Claude Code Gateway
 
-`cc2api` 是一个基于 Rust 实现的 Claude Code 反检测网关与账号池管理平台。它将对外网关、账号调度、令牌鉴权、用量管理和 Web 管理后台整合到同一个项目中，适合需要统一管理多个 Claude 账号、控制对外访问口径、降低客户端指纹差异的场景。
+`claude-code-gateway` 是一个基于 Rust 实现的 Claude Code 反检测网关与账号池管理平台。它将对外网关、账号调度、令牌鉴权、用量管理和 Web 管理后台整合到同一个项目中，适合需要统一管理多个 Claude 账号、控制对外访问口径、降低客户端指纹差异的场景。
 
 项目当前由两部分组成：
 
@@ -56,7 +56,7 @@ Claude Code / 外部 API 客户端
         | x-api-key 或 Authorization: Bearer <sk-...>
         v
   +------------------------+
-  |      cc2api 网关       |
+  | claude-code-gateway 网关 |
   |------------------------|
   | 1. 令牌鉴权            |
   | 2. 会话哈希计算        |
@@ -184,7 +184,7 @@ admin
 | `DATABASE_PORT` | `5432` | PostgreSQL 端口 |
 | `DATABASE_USER` | `postgres` | PostgreSQL 用户名 |
 | `DATABASE_PASSWORD` | 空 | PostgreSQL 密码 |
-| `DATABASE_DBNAME` | `cc2api` | PostgreSQL 数据库名 |
+| `DATABASE_DBNAME` | `claude_code_gateway` | PostgreSQL 数据库名 |
 
 说明：
 
@@ -236,7 +236,7 @@ LOG_LEVEL=info
 ```env
 SERVER_PORT=5674
 DATABASE_DRIVER=postgres
-DATABASE_DSN=postgres://postgres:your_password@localhost:5432/cc2api?sslmode=disable
+DATABASE_DSN=postgres://postgres:your_password@localhost:5432/claude_code_gateway?sslmode=disable
 REDIS_HOST=localhost
 REDIS_PORT=6379
 ADMIN_PASSWORD=change-me
@@ -360,7 +360,7 @@ cd ..
 cargo build --release
 
 # 3. 启动
-./target/release/cc2api
+./target/release/claude-code-gateway
 ```
 
 ### Docker 部署
@@ -384,7 +384,7 @@ docker compose up -d
 
 - 构建镜像时使用根目录上下文
 - 将宿主机根目录 `.env` 作为容器环境文件
-- 将 SQLite 数据持久化到命名卷 `cc2api-data`
+- 将 SQLite 数据持久化到命名卷 `claude-code-gateway-data`
 - 默认暴露容器 `5674` 端口
 
 如果你使用默认 SQLite，Docker 部署下的数据文件会保存在卷中，而不是代码仓库目录中。
@@ -1049,7 +1049,7 @@ image_name=ghcr.io/mamoworks/claude-code-gateway
 
 ### 5. 多实例部署请启用 Redis
 
-如果你部署多个 `cc2api` 实例但没有 Redis，那么：
+如果你部署多个 `claude-code-gateway` 实例但没有 Redis，那么：
 
 - 会话粘性只在单个进程内生效
 - 并发计数无法跨实例共享

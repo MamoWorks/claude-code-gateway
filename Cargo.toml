@@ -1,5 +1,5 @@
 [package]
-name = "cc2api"
+name = "claude-code-gateway"
 version = "0.1.0"
 edition = "2021"
 

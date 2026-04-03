@@ -29,11 +29,11 @@ RUN case "$TARGETPLATFORM" in \
       "linux/arm64") \
         export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc && \
         cargo build --release --target aarch64-unknown-linux-gnu && \
-        cp target/aarch64-unknown-linux-gnu/release/cc2api /app/cc2api-bin \
+        cp target/aarch64-unknown-linux-gnu/release/claude-code-gateway /app/claude-code-gateway-bin \
         ;; \
       *) \
         cargo build --release && \
-        cp target/release/cc2api /app/cc2api-bin \
+        cp target/release/claude-code-gateway /app/claude-code-gateway-bin \
         ;; \
     esac
 
@@ -42,9 +42,9 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 
-COPY --from=backend /app/cc2api-bin ./cc2api
+COPY --from=backend /app/claude-code-gateway-bin ./claude-code-gateway
 COPY --from=frontend /app/web/dist ./web/dist/
 
 RUN mkdir -p data
 EXPOSE 5674
-CMD ["./cc2api"]
+CMD ["./claude-code-gateway"]

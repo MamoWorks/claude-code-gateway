@@ -9,7 +9,7 @@ let authenticated = false;
  * @returns 验证是否通过
  */
 async function tryRestoreAuth(): Promise<boolean> {
-  const saved = localStorage.getItem('cc2api_auth');
+  const saved = localStorage.getItem('claude-code-gateway_auth');
   if (!saved) return false;
   setAuth(saved);
   try {
@@ -17,7 +17,7 @@ async function tryRestoreAuth(): Promise<boolean> {
     authenticated = true;
     return true;
   } catch {
-    localStorage.removeItem('cc2api_auth');
+    localStorage.removeItem('claude-code-gateway_auth');
     setAuth('');
     return false;
   }
@@ -72,14 +72,14 @@ export async function login(password: string): Promise<void> {
   setAuth(password);
   await api.getDashboard();
   authenticated = true;
-  localStorage.setItem('cc2api_auth', password);
+  localStorage.setItem('claude-code-gateway_auth', password);
   await router.push({ name: 'dashboard' });
 }
 
 /** 退出登录并跳转到登录页 */
 export function logout(): void {
   authenticated = false;
-  localStorage.removeItem('cc2api_auth');
+  localStorage.removeItem('claude-code-gateway_auth');
   setAuth('');
   router.push({ name: 'login' });
 }

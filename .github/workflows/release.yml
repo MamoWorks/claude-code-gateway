@@ -170,6 +170,7 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
+          pattern: cc2api-*
           path: artifacts
           merge-multiple: true
 
