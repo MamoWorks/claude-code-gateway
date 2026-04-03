@@ -23,6 +23,7 @@ RUN case "$TARGETPLATFORM" in \
 COPY Cargo.toml Cargo.lock ./
 COPY src/ ./src/
 COPY craftls/ ./craftls/
+COPY --from=frontend /app/web/dist ./web/dist/
 
 RUN case "$TARGETPLATFORM" in \
       "linux/arm64") \

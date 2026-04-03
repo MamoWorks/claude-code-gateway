@@ -9,7 +9,21 @@ REM Build frontend if dist not exists
 if not exist "web\dist" (
     echo Building frontend...
     pushd web
-    call npm ci && call npm run build
+    if not exist "node_modules\@vue\tsconfig" (
+        echo Installing frontend dependencies...
+        call npm install
+        if errorlevel 1 (
+            popd
+            popd
+            exit /b 1
+        )
+    )
+    call npm run build
+    if errorlevel 1 (
+        popd
+        popd
+        exit /b 1
+    )
     popd
 )
 

@@ -1,7 +1,17 @@
 {
-  "extends": "@vue/tsconfig/tsconfig.dom.json",
   "compilerOptions": {
     "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.app.tsbuildinfo",
+    "target": "ES2023",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "useDefineForClassFields": true,
+    "jsx": "preserve",
+    "noEmit": true,
+    "skipLibCheck": true,
     "types": ["vite/client"],
     "baseUrl": ".",
     "paths": {

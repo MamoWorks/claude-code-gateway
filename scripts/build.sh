@@ -43,7 +43,13 @@ cargo clean
 
 # 2. 构建前端（编译时嵌入二进制）
 echo "Building frontend..."
-cd web && npm ci && npm run build && cd ..
+cd web
+if [ ! -d "node_modules/@vue/tsconfig" ]; then
+    echo "Installing frontend dependencies..."
+    npm install
+fi
+npm run build
+cd ..
 
 # 3. 安装目标工具链（如果交叉编译）
 if [ -n "$RUST_TARGET" ]; then
