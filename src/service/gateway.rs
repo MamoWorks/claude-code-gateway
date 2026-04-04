@@ -89,9 +89,9 @@ impl GatewayService {
             .account_svc
             .acquire_slot(account.id, account.concurrency)
             .await
-            .map_err(|_| AppError::TooManyRequests)?;
+            .map_err(|_| AppError::TooManyRequests("concurrency slot unavailable".into()))?;
         if !acquired {
-            return Err(AppError::TooManyRequests);
+            return Err(AppError::TooManyRequests("concurrency slot unavailable".into()));
         }
 
         // 确保在函数结束后释放槽位

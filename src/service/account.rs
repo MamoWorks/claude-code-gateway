@@ -156,9 +156,15 @@ impl AccountService {
     }
 
     /// 从 Anthropic API 获取账号用量并缓存到数据库。
+    /// 仅支持 OAuth 账号，SetupToken 账号无法查询用量。
     pub async fn refresh_usage(&self, id: i64) -> Result<serde_json::Value, AppError> {
         let account = self.store.get_by_id(id).await?;
-        let token = self.resolve_upstream_token(account.id).await?;
+        if account.auth_type != crate::model::account::AccountAuthType::Oauth {
+            return Err(AppError::BadRequest(
+                "usage query is only supported for OAuth accounts, SetupToken accounts cannot query usage via this endpoint".into(),
+            ));
+        }
+        let token = self.resolve_oauth_access_token(&account).await?;
         let usage = crate::service::oauth::fetch_usage(&token, &account.proxy_url).await?;
         let usage_str = serde_json::to_string(&usage).unwrap_or_else(|_| "{}".into());
         self.store.update_usage(id, &usage_str).await?;

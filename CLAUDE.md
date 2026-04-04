@@ -63,3 +63,5 @@ All via environment variables (see `.env.example`). Key ones: `SERVER_HOST`/`SER
 ## Dual Auth Modes
 
 Accounts support two auth types: **SetupToken** (classic API key) and **OAuth** (with automatic access token refresh via stored refresh tokens). Both flows converge in `AccountService::select_account`.
+
+## KEY: EVERY TIME YOU WANT TO CHANGE STH, PLEASE REFER cc-gateway

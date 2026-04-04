@@ -1,4 +1,5 @@
 use crate::error::AppError;
+use crate::tlsfp::make_request_client;
 use chrono::{DateTime, Utc};
 use reqwest::Proxy;
 use serde::Deserialize;
@@ -58,7 +59,7 @@ impl TokenTester {
             "messages": [{"role": "user", "content": "hi"}]
         });
 
-        let client = build_client(proxy_url)?;
+        let client = make_request_client(proxy_url);
 
         let resp = client
             .post("https://api.anthropic.com/v1/messages?beta=true")
@@ -139,7 +140,7 @@ pub async fn refresh_oauth_token(
 
 /// 从 Anthropic OAuth API 获取账号用量数据。
 pub async fn fetch_usage(token: &str, proxy_url: &str) -> Result<Value, AppError> {
-    let client = build_client(proxy_url)?;
+    let client = make_request_client(proxy_url);
 
     let resp = client
         .get("https://api.anthropic.com/api/oauth/usage")
@@ -152,11 +153,23 @@ pub async fn fetch_usage(token: &str, proxy_url: &str) -> Result<Value, AppError
         .await
         .map_err(|e| AppError::Internal(format!("usage request failed: {}", e)))?;
 
-    if resp.status() != 200 {
-        return Err(AppError::Internal(format!(
-            "usage fetch failed: status {}",
-            resp.status()
-        )));
+    let status = resp.status();
+    if status != 200 {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(match status.as_u16() {
+            401 | 403 => AppError::BadRequest(format!(
+                "usage fetch failed: status {} — token may be expired or invalid: {}",
+                status, text
+            )),
+            429 => AppError::TooManyRequests(format!(
+                "usage endpoint rate limited (429), try again later: {}",
+                text
+            )),
+            _ => AppError::Internal(format!(
+                "usage fetch failed: status {} {}",
+                status, text
+            )),
+        });
     }
 
     let data: Value = resp
