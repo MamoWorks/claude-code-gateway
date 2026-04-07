@@ -293,8 +293,10 @@ async function toggleScheduling(a: Account) {
 function formatTimeLeft(resetsAt: string): string {
   const diff = new Date(resetsAt).getTime() - Date.now();
   if (diff <= 0) return '已重置';
-  const hours = Math.floor(diff / 3600000);
+  const days = Math.floor(diff / 86400000);
+  const hours = Math.floor((diff % 86400000) / 3600000);
   const minutes = Math.floor((diff % 3600000) / 60000);
+  if (days > 0) return `${days}d${hours}h${minutes}m`;
   if (hours > 0) return `${hours}h${minutes}m`;
   return `${minutes}m`;
 }
@@ -611,42 +613,42 @@ async function copyText(text: string) {
             <div class="space-y-0.5">
               <div class="flex justify-between text-[11px]">
                 <span class="text-[#8c8475]">5 小时</span>
-                <span class="text-[#5c5647] font-medium">{{ a.usage_data?.five_hour ? (a.usage_data.five_hour.utilization * 100).toFixed(0) : '0' }}%
+                <span class="text-[#5c5647] font-medium">{{ a.usage_data?.five_hour ? Math.round(a.usage_data.five_hour.utilization) : '0' }}%
                   <span v-if="a.usage_data?.five_hour" class="text-[#b5b0a6] font-normal">· {{ formatTimeLeft(a.usage_data.five_hour.resets_at) }}</span>
                 </span>
               </div>
               <div class="h-1.5 bg-[#f0ebe4] rounded-full overflow-hidden">
-                <div :class="usageBarColor(a.usage_data?.five_hour ? a.usage_data.five_hour.utilization * 100 : 0)"
+                <div :class="usageBarColor(a.usage_data?.five_hour ? a.usage_data.five_hour.utilization : 0)"
                   class="h-full rounded-full transition-all duration-300"
-                  :style="{ width: (a.usage_data?.five_hour ? Math.min(a.usage_data.five_hour.utilization * 100, 100) : 0) + '%' }" />
+                  :style="{ width: (a.usage_data?.five_hour ? Math.min(a.usage_data.five_hour.utilization, 100) : 0) + '%' }" />
               </div>
             </div>
             <!-- 7 天 -->
             <div class="space-y-0.5">
               <div class="flex justify-between text-[11px]">
                 <span class="text-[#8c8475]">7 天</span>
-                <span class="text-[#5c5647] font-medium">{{ a.usage_data?.seven_day ? (a.usage_data.seven_day.utilization * 100).toFixed(0) : '0' }}%
+                <span class="text-[#5c5647] font-medium">{{ a.usage_data?.seven_day ? Math.round(a.usage_data.seven_day.utilization) : '0' }}%
                   <span v-if="a.usage_data?.seven_day" class="text-[#b5b0a6] font-normal">· {{ formatTimeLeft(a.usage_data.seven_day.resets_at) }}</span>
                 </span>
               </div>
               <div class="h-1.5 bg-[#f0ebe4] rounded-full overflow-hidden">
-                <div :class="usageBarColor(a.usage_data?.seven_day ? a.usage_data.seven_day.utilization * 100 : 0)"
+                <div :class="usageBarColor(a.usage_data?.seven_day ? a.usage_data.seven_day.utilization : 0)"
                   class="h-full rounded-full transition-all duration-300"
-                  :style="{ width: (a.usage_data?.seven_day ? Math.min(a.usage_data.seven_day.utilization * 100, 100) : 0) + '%' }" />
+                  :style="{ width: (a.usage_data?.seven_day ? Math.min(a.usage_data.seven_day.utilization, 100) : 0) + '%' }" />
               </div>
             </div>
             <!-- 7 天 Sonnet -->
             <div class="space-y-0.5">
               <div class="flex justify-between text-[11px]">
                 <span class="text-[#8c8475]">7 天 Sonnet</span>
-                <span class="text-[#5c5647] font-medium">{{ a.usage_data?.seven_day_sonnet ? (a.usage_data.seven_day_sonnet.utilization * 100).toFixed(0) : '0' }}%
+                <span class="text-[#5c5647] font-medium">{{ a.usage_data?.seven_day_sonnet ? Math.round(a.usage_data.seven_day_sonnet.utilization) : '0' }}%
                   <span v-if="a.usage_data?.seven_day_sonnet" class="text-[#b5b0a6] font-normal">· {{ formatTimeLeft(a.usage_data.seven_day_sonnet.resets_at) }}</span>
                 </span>
               </div>
               <div class="h-1.5 bg-[#f0ebe4] rounded-full overflow-hidden">
-                <div :class="usageBarColor(a.usage_data?.seven_day_sonnet ? a.usage_data.seven_day_sonnet.utilization * 100 : 0)"
+                <div :class="usageBarColor(a.usage_data?.seven_day_sonnet ? a.usage_data.seven_day_sonnet.utilization : 0)"
                   class="h-full rounded-full transition-all duration-300"
-                  :style="{ width: (a.usage_data?.seven_day_sonnet ? Math.min(a.usage_data.seven_day_sonnet.utilization * 100, 100) : 0) + '%' }" />
+                  :style="{ width: (a.usage_data?.seven_day_sonnet ? Math.min(a.usage_data.seven_day_sonnet.utilization, 100) : 0) + '%' }" />
               </div>
             </div>
           </div>

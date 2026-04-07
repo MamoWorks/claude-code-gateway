@@ -1,15 +1,14 @@
 use crate::error::AppError;
 use crate::tlsfp::make_request_client;
 use chrono::{DateTime, Utc};
-use reqwest::Proxy;
 use serde::Deserialize;
 use serde_json::Value;
 
 const OAUTH_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 const OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const OAUTH_SCOPES: &[&str] = &[
-    "user:inference",
     "user:profile",
+    "user:inference",
     "user:sessions:claude_code",
     "user:mcp_servers",
     "user:file_upload",
@@ -29,18 +28,6 @@ struct OAuthRefreshResponse {
     refresh_token: String,
     #[serde(default)]
     expires_in: i64,
-}
-
-fn build_client(proxy_url: &str) -> Result<reqwest::Client, AppError> {
-    let mut builder = reqwest::Client::builder();
-    if !proxy_url.is_empty() {
-        if let Ok(proxy) = Proxy::all(proxy_url) {
-            builder = builder.proxy(proxy);
-        }
-    }
-    builder
-        .build()
-        .map_err(|e| AppError::Internal(format!("http client: {}", e)))
 }
 
 /// 通过轻量级 API 调用验证 Setup Token。
@@ -91,7 +78,7 @@ pub async fn refresh_oauth_token(
     refresh_token: &str,
     proxy_url: &str,
 ) -> Result<RefreshedOAuthTokens, AppError> {
-    let client = build_client(proxy_url)?;
+    let client = make_request_client(proxy_url);
     let body = serde_json::json!({
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,

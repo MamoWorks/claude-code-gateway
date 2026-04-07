@@ -1,6 +1,7 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
+use tracing::error;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
@@ -38,7 +39,10 @@ impl IntoResponse for AppError {
             AppError::TooManyRequests(_) => (StatusCode::TOO_MANY_REQUESTS, ""),
             AppError::BadGateway(_) => (StatusCode::BAD_GATEWAY, ""),
             AppError::ServiceUnavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, ""),
-            AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
+            AppError::Internal(detail) => {
+                error!("internal error: {}", detail);
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+            }
         };
         let body = json!({"error": if msg.is_empty() { self.to_string() } else { msg.to_string() }});
         (status, axum::Json(body)).into_response()
