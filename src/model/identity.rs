@@ -6,187 +6,94 @@ use super::account::{CanonicalEnvData, CanonicalProcessData, CanonicalPromptEnvD
 
 fn env_presets() -> Vec<CanonicalEnvData> {
     vec![
-        // --- darwin arm64 ---
-        CanonicalEnvData {
-            platform: "darwin".into(),
-            platform_raw: "darwin".into(),
-            arch: "arm64".into(),
-            node_version: "v22.15.0".into(),
-            terminal: "iTerm.app".into(),
-            package_managers: "npm,pnpm".into(),
-            runtimes: "node".into(),
-            is_claude_ai_auth: true,
-            version: "2.1.81".into(),
-            version_base: "2.1.81".into(),
-            build_time: "2026-03-20T21:26:18Z".into(),
-            deployment_environment: "unknown-darwin".into(),
-            vcs: "git".into(),
-            ..Default::default()
-        },
-        CanonicalEnvData {
-            platform: "darwin".into(),
-            platform_raw: "darwin".into(),
-            arch: "arm64".into(),
-            node_version: "v24.3.0".into(),
-            terminal: "Apple_Terminal".into(),
-            package_managers: "npm,yarn".into(),
-            runtimes: "node".into(),
-            is_claude_ai_auth: true,
-            version: "2.1.81".into(),
-            version_base: "2.1.81".into(),
-            build_time: "2026-03-20T21:26:18Z".into(),
-            deployment_environment: "unknown-darwin".into(),
-            vcs: "git".into(),
-            ..Default::default()
-        },
-        CanonicalEnvData {
-            platform: "darwin".into(),
-            platform_raw: "darwin".into(),
-            arch: "arm64".into(),
-            node_version: "v22.15.0".into(),
-            terminal: "vscode".into(),
-            package_managers: "npm,pnpm".into(),
-            runtimes: "node".into(),
-            is_claude_ai_auth: true,
-            version: "2.1.81".into(),
-            version_base: "2.1.81".into(),
-            build_time: "2026-03-20T21:26:18Z".into(),
-            deployment_environment: "unknown-darwin".into(),
-            vcs: "git".into(),
-            ..Default::default()
-        },
-        CanonicalEnvData {
-            platform: "darwin".into(),
-            platform_raw: "darwin".into(),
-            arch: "arm64".into(),
-            node_version: "v24.3.0".into(),
-            terminal: "WarpTerminal".into(),
-            package_managers: "npm".into(),
-            runtimes: "node".into(),
-            is_claude_ai_auth: true,
-            version: "2.1.81".into(),
-            version_base: "2.1.81".into(),
-            build_time: "2026-03-20T21:26:18Z".into(),
-            deployment_environment: "unknown-darwin".into(),
-            vcs: "git".into(),
-            ..Default::default()
-        },
-        // --- darwin x64 ---
-        CanonicalEnvData {
-            platform: "darwin".into(),
-            platform_raw: "darwin".into(),
-            arch: "x64".into(),
-            node_version: "v22.15.0".into(),
-            terminal: "iTerm.app".into(),
-            package_managers: "npm,yarn".into(),
-            runtimes: "node".into(),
-            is_claude_ai_auth: true,
-            version: "2.1.81".into(),
-            version_base: "2.1.81".into(),
-            build_time: "2026-03-20T21:26:18Z".into(),
-            deployment_environment: "unknown-darwin".into(),
-            vcs: "git".into(),
-            ..Default::default()
-        },
-        CanonicalEnvData {
-            platform: "darwin".into(),
-            platform_raw: "darwin".into(),
-            arch: "x64".into(),
-            node_version: "v24.3.0".into(),
-            terminal: "Apple_Terminal".into(),
-            package_managers: "npm,pnpm".into(),
-            runtimes: "node".into(),
-            is_claude_ai_auth: true,
-            version: "2.1.81".into(),
-            version_base: "2.1.81".into(),
-            build_time: "2026-03-20T21:26:18Z".into(),
-            deployment_environment: "unknown-darwin".into(),
-            vcs: "git".into(),
-            ..Default::default()
-        },
-        // --- linux ---
-        CanonicalEnvData {
-            platform: "linux".into(),
-            platform_raw: "linux".into(),
-            arch: "x64".into(),
-            node_version: "v22.15.0".into(),
-            terminal: "gnome-terminal".into(),
-            package_managers: "npm,pnpm".into(),
-            runtimes: "node".into(),
-            is_claude_ai_auth: true,
-            version: "2.1.81".into(),
-            version_base: "2.1.81".into(),
-            build_time: "2026-03-20T21:26:18Z".into(),
-            deployment_environment: "unknown-linux".into(),
-            vcs: "git".into(),
-            ..Default::default()
-        },
-        CanonicalEnvData {
-            platform: "linux".into(),
-            platform_raw: "linux".into(),
-            arch: "x64".into(),
-            node_version: "v24.3.0".into(),
-            terminal: "ssh-session".into(),
-            package_managers: "npm".into(),
-            runtimes: "node".into(),
-            is_claude_ai_auth: true,
-            version: "2.1.81".into(),
-            version_base: "2.1.81".into(),
-            build_time: "2026-03-20T21:26:18Z".into(),
-            deployment_environment: "unknown-linux".into(),
-            vcs: "git".into(),
-            ..Default::default()
-        },
-        CanonicalEnvData {
-            platform: "linux".into(),
-            platform_raw: "linux".into(),
-            arch: "x64".into(),
-            node_version: "v22.15.0".into(),
-            terminal: "xterm-256color".into(),
-            package_managers: "npm,yarn".into(),
-            runtimes: "node".into(),
-            is_claude_ai_auth: true,
-            version: "2.1.81".into(),
-            version_base: "2.1.81".into(),
-            build_time: "2026-03-20T21:26:18Z".into(),
-            deployment_environment: "unknown-linux".into(),
-            vcs: "git".into(),
-            ..Default::default()
-        },
-        // --- win32 ---
-        CanonicalEnvData {
-            platform: "win32".into(),
-            platform_raw: "win32".into(),
-            arch: "x64".into(),
-            node_version: "v22.15.0".into(),
-            terminal: "windows-terminal".into(),
-            package_managers: "npm,pnpm".into(),
-            runtimes: "node".into(),
-            is_claude_ai_auth: true,
-            version: "2.1.81".into(),
-            version_base: "2.1.81".into(),
-            build_time: "2026-03-20T21:26:18Z".into(),
-            deployment_environment: "unknown-win32".into(),
-            vcs: "git".into(),
-            ..Default::default()
-        },
-        CanonicalEnvData {
-            platform: "win32".into(),
-            platform_raw: "win32".into(),
-            arch: "x64".into(),
-            node_version: "v24.3.0".into(),
-            terminal: "vscode".into(),
-            package_managers: "npm,yarn".into(),
-            runtimes: "node".into(),
-            is_claude_ai_auth: true,
-            version: "2.1.81".into(),
-            version_base: "2.1.81".into(),
-            build_time: "2026-03-20T21:26:18Z".into(),
-            deployment_environment: "unknown-win32".into(),
-            vcs: "git".into(),
-            ..Default::default()
-        },
+        // --- darwin arm64 (8 presets) ---
+        dp("arm64", "v22.15.0", "iTerm.app", "npm,pnpm"),
+        dp("arm64", "v24.3.0", "Apple_Terminal", "npm,yarn"),
+        dp("arm64", "v22.15.0", "vscode", "npm,pnpm"),
+        dp("arm64", "v24.3.0", "WarpTerminal", "npm"),
+        dp("arm64", "v22.15.0", "kitty", "npm,yarn,pnpm"),
+        dp("arm64", "v24.3.0", "iTerm.app", "npm"),
+        dp("arm64", "v22.15.0", "tmux", "npm,pnpm"),
+        dp("arm64", "v24.3.0", "ghostty", "npm,yarn"),
+        // --- darwin x64 (4 presets) ---
+        dx("v22.15.0", "iTerm.app", "npm,yarn"),
+        dx("v24.3.0", "Apple_Terminal", "npm,pnpm"),
+        dx("v22.15.0", "vscode", "npm"),
+        dx("v24.3.0", "iTerm.app", "npm,pnpm"),
+        // --- linux (6 presets) ---
+        lp("v22.15.0", "gnome-terminal", "npm,pnpm"),
+        lp("v24.3.0", "ssh-session", "npm"),
+        lp("v22.15.0", "xterm-256color", "npm,yarn"),
+        lp("v24.3.0", "vscode", "npm,pnpm"),
+        lp("v22.15.0", "tmux", "npm"),
+        lp("v24.3.0", "alacritty", "npm,yarn"),
+        // --- win32 (4 presets) ---
+        wp("v22.15.0", "windows-terminal", "npm,pnpm"),
+        wp("v24.3.0", "vscode", "npm,yarn"),
+        wp("v22.15.0", "mingw64", "npm"),
+        wp("v24.3.0", "windows-terminal", "npm,pnpm"),
     ]
+}
+
+fn dp(arch: &str, node: &str, term: &str, pm: &str) -> CanonicalEnvData {
+    CanonicalEnvData {
+        platform: "darwin".into(),
+        platform_raw: "darwin".into(),
+        arch: arch.into(),
+        node_version: node.into(),
+        terminal: term.into(),
+        package_managers: pm.into(),
+        runtimes: "node".into(),
+        is_claude_ai_auth: true,
+        version: "2.1.81".into(),
+        version_base: "2.1.81".into(),
+        build_time: "2026-03-20T21:26:18Z".into(),
+        deployment_environment: "unknown-darwin".into(),
+        vcs: "git".into(),
+        ..Default::default()
+    }
+}
+
+fn dx(node: &str, term: &str, pm: &str) -> CanonicalEnvData {
+    dp("x64", node, term, pm)
+}
+
+fn lp(node: &str, term: &str, pm: &str) -> CanonicalEnvData {
+    CanonicalEnvData {
+        platform: "linux".into(),
+        platform_raw: "linux".into(),
+        arch: "x64".into(),
+        node_version: node.into(),
+        terminal: term.into(),
+        package_managers: pm.into(),
+        runtimes: "node".into(),
+        is_claude_ai_auth: true,
+        version: "2.1.81".into(),
+        version_base: "2.1.81".into(),
+        build_time: "2026-03-20T21:26:18Z".into(),
+        deployment_environment: "unknown-linux".into(),
+        vcs: "git".into(),
+        ..Default::default()
+    }
+}
+
+fn wp(node: &str, term: &str, pm: &str) -> CanonicalEnvData {
+    CanonicalEnvData {
+        platform: "win32".into(),
+        platform_raw: "win32".into(),
+        arch: "x64".into(),
+        node_version: node.into(),
+        terminal: term.into(),
+        package_managers: pm.into(),
+        runtimes: "node".into(),
+        is_claude_ai_auth: true,
+        version: "2.1.81".into(),
+        version_base: "2.1.81".into(),
+        build_time: "2026-03-20T21:26:18Z".into(),
+        deployment_environment: "unknown-win32".into(),
+        vcs: "git".into(),
+        ..Default::default()
+    }
 }
 
 fn prompt_presets() -> HashMap<&'static str, CanonicalPromptEnvData> {
