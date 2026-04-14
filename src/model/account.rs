@@ -270,4 +270,8 @@ pub struct CanonicalProcessData {
     pub rss_range: [i64; 2],
     pub heap_total_range: [i64; 2],
     pub heap_used_range: [i64; 2],
+    #[serde(default)]
+    pub external_range: [i64; 2],
+    #[serde(default)]
+    pub array_buffers_range: [i64; 2],
 }

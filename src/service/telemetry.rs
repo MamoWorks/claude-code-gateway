@@ -55,6 +55,7 @@ pub fn fake_telemetry_response() -> serde_json::Value {
 struct TelemetrySession {
     account: Account,
     token: String,
+    started_at: Instant,
     expires_at: Instant,
     expires_at_utc: chrono::DateTime<Utc>,
     last_event_batch_at: Instant,
@@ -125,6 +126,7 @@ impl TelemetryService {
         let session = TelemetrySession {
             account: account.clone(),
             token,
+            started_at: now,
             expires_at: now + SESSION_TTL,
             expires_at_utc: Utc::now() + chrono::Duration::from_std(SESSION_TTL).unwrap(),
             last_event_batch_at: now - EVENT_BATCH_INTERVAL, // 立即触发首次
@@ -188,7 +190,8 @@ async fn telemetry_loop(
 
         // --- event_logging/batch ---
         if now.duration_since(session.last_event_batch_at) >= EVENT_BATCH_INTERVAL {
-            let payload = build_event_batch(&session.account);
+            let uptime_secs = now.duration_since(session.started_at).as_secs_f64();
+            let payload = build_event_batch(&session.account, uptime_secs);
             let token = session.token.clone();
             let c = client.clone();
             session.last_event_batch_at = now;
@@ -249,7 +252,7 @@ async fn session_ua(store: &Arc<AccountStore>, account_id: i64) -> String {
         .and_then(|a| serde_json::from_value::<CanonicalEnvData>(a.canonical_env).ok())
         .map(|e| e.version)
         .unwrap_or_else(|| "2.1.81".into());
-    format!("claude-code/{} (external, cli)", version)
+    format!("claude-code/{}", version)
 }
 
 // ---------------------------------------------------------------------------
@@ -308,12 +311,21 @@ fn random_in_range(min: i64, max: i64) -> i64 {
     rand::thread_rng().gen_range(min..max)
 }
 
-fn build_process_json(proc: &CanonicalProcessData) -> serde_json::Value {
+fn build_process_json(proc: &CanonicalProcessData, uptime_secs: f64) -> serde_json::Value {
+    let mut rng = rand::thread_rng();
+    let cpu_user = rng.gen_range(50_000i64..500_000);
+    let cpu_system = rng.gen_range(15_000i64..150_000);
+    let cpu_percent = rng.gen_range(0.5f64..5.0);
     json!({
-        "constrainedMemory": proc.constrained_memory,
+        "uptime": uptime_secs,
         "rss": random_in_range(proc.rss_range[0], proc.rss_range[1]),
         "heapTotal": random_in_range(proc.heap_total_range[0], proc.heap_total_range[1]),
         "heapUsed": random_in_range(proc.heap_used_range[0], proc.heap_used_range[1]),
+        "external": random_in_range(proc.external_range[0], proc.external_range[1]),
+        "arrayBuffers": random_in_range(proc.array_buffers_range[0], proc.array_buffers_range[1]),
+        "constrainedMemory": proc.constrained_memory,
+        "cpuUsage": { "user": cpu_user, "system": cpu_system },
+        "cpuPercent": cpu_percent,
     })
 }
 
@@ -337,41 +349,28 @@ fn derive_account_uuid(account: &Account) -> String {
     })
 }
 
+/// JS Date.toISOString() 兼容格式：毫秒精度 + Z 后缀。
+fn js_iso_timestamp() -> String {
+    Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+}
+
+fn build_full_env(env: &CanonicalEnvData) -> serde_json::Value {
+    crate::model::identity::build_full_env_json(env)
+}
+
 /// 构造 /api/event_logging/batch 请求体。
-fn build_event_batch(account: &Account) -> serde_json::Value {
+fn build_event_batch(account: &Account, uptime_secs: f64) -> serde_json::Value {
     let env = parse_env(account);
     let proc = parse_process(account);
     let account_uuid = derive_account_uuid(account);
     let session_id = uuid::Uuid::new_v4().to_string();
     let process_b64 = {
-        let p = build_process_json(&proc);
+        let p = build_process_json(&proc, uptime_secs);
         let bytes = serde_json::to_vec(&p).unwrap_or_default();
         base64::engine::general_purpose::STANDARD.encode(&bytes)
     };
 
-    let env_obj = json!({
-        "platform": env.platform,
-        "platform_raw": env.platform_raw,
-        "arch": env.arch,
-        "node_version": env.node_version,
-        "terminal": env.terminal,
-        "package_managers": env.package_managers,
-        "runtimes": env.runtimes,
-        "is_running_with_bun": false,
-        "is_ci": false,
-        "is_claubbit": false,
-        "is_claude_code_remote": false,
-        "is_local_agent_mode": false,
-        "is_conductor": false,
-        "is_github_action": false,
-        "is_claude_code_action": false,
-        "is_claude_ai_auth": env.is_claude_ai_auth,
-        "version": env.version,
-        "version_base": env.version_base,
-        "build_time": env.build_time,
-        "deployment_environment": env.deployment_environment,
-        "vcs": env.vcs,
-    });
+    let env_obj = build_full_env(&env);
 
     let mut auth = json!({});
     auth["account_uuid"] = json!(account_uuid);
@@ -384,11 +383,28 @@ fn build_event_batch(account: &Account) -> serde_json::Value {
         "event_data": {
             "event_id": uuid::Uuid::new_v4().to_string(),
             "event_name": "tengu_api_success",
-            "client_timestamp": Utc::now().to_rfc3339(),
+            "client_timestamp": js_iso_timestamp(),
             "device_id": account.device_id,
             "email": account.email,
             "session_id": session_id,
             "model": "claude-sonnet-4-20250514",
+            "user_type": "external",
+            "is_interactive": true,
+            "client_type": "cli",
+            "entrypoint": "cli",
+            "betas": "",
+            "agent_sdk_version": "",
+            "swe_bench_run_id": "",
+            "swe_bench_instance_id": "",
+            "swe_bench_task_id": "",
+            "agent_id": "",
+            "parent_session_id": "",
+            "agent_type": "",
+            "team_name": "",
+            "skill_name": "",
+            "plugin_name": "",
+            "marketplace_name": "",
+            "additional_metadata": "",
             "auth": auth,
             "env": env_obj,
             "process": process_b64,
@@ -403,8 +419,10 @@ fn build_growthbook_eval(account: &Account) -> serde_json::Value {
     let env = parse_env(account);
     let account_uuid = derive_account_uuid(account);
 
+    let session_id = uuid::Uuid::new_v4().to_string();
     let mut attrs = json!({
         "id": account.device_id,
+        "sessionId": session_id,
         "deviceID": account.device_id,
         "platform": env.platform,
         "appVersion": env.version,

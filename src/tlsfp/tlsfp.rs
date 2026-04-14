@@ -300,8 +300,11 @@ pub static NODEJS_FINGERPRINT: Fingerprint = Fingerprint {
     shuffle_extensions: false,
 };
 
-/// 构建带 Node.js TLS 指纹的 rustls ClientConfig。
-fn build_tls_config() -> rustls::ClientConfig {
+/// 全局 TLS 配置单例，启动时构建一次，所有请求共用。
+static SHARED_TLS_CONFIG: once_cell::sync::Lazy<Arc<rustls::ClientConfig>> =
+    once_cell::sync::Lazy::new(|| Arc::new(build_tls_config_inner()));
+
+fn build_tls_config_inner() -> rustls::ClientConfig {
     let root_store = RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
@@ -324,7 +327,7 @@ fn build_tls_config() -> rustls::ClientConfig {
 /// 创建带 TLS 指纹伪装的 reqwest 客户端。
 /// 支持直连和代理（HTTP/SOCKS5）。
 pub fn make_request_client(proxy_url: &str) -> reqwest::Client {
-    let tls_config = build_tls_config();
+    let tls_config = (*SHARED_TLS_CONFIG).clone();
 
     let mut builder = reqwest::Client::builder()
         .use_preconfigured_tls(tls_config)

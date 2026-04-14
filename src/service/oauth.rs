@@ -1,4 +1,5 @@
 use crate::error::AppError;
+use crate::model::account::CanonicalEnvData;
 use crate::tlsfp::make_request_client;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -39,7 +40,25 @@ impl TokenTester {
     }
 
     /// 通过发送最小消息请求验证 Setup Token 有效性。
-    pub async fn test_token(&self, token: &str, proxy_url: &str) -> Result<(), AppError> {
+    pub async fn test_token(
+        &self,
+        token: &str,
+        proxy_url: &str,
+        canonical_env: &Value,
+    ) -> Result<(), AppError> {
+        let env: CanonicalEnvData =
+            serde_json::from_value(canonical_env.clone()).unwrap_or_default();
+        let version = if env.version.is_empty() {
+            "2.1.81"
+        } else {
+            &env.version
+        };
+        let stainless_os = match env.platform.as_str() {
+            "darwin" => "Mac OS X",
+            "win32" => "Windows",
+            _ => "Linux",
+        };
+
         let body = serde_json::json!({
             "model": "claude-haiku-4-5-20251001",
             "max_tokens": 1,
@@ -52,10 +71,21 @@ impl TokenTester {
             .post("https://api.anthropic.com/v1/messages?beta=true")
             .header("Authorization", format!("Bearer {}", token))
             .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
             .header("anthropic-version", "2023-06-01")
-            .header("anthropic-beta", "oauth-2025-04-20")
-            .header("User-Agent", "claude-cli/2.1.89 (external, cli)")
+            .header("anthropic-beta", "oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05")
+            .header("anthropic-dangerous-direct-browser-access", "true")
+            .header("User-Agent", format!("claude-cli/{} (external, cli)", version))
             .header("x-app", "cli")
+            .header("accept-encoding", "gzip, deflate, br, zstd")
+            .header("X-Stainless-Lang", "js")
+            .header("X-Stainless-Package-Version", "0.70.0")
+            .header("X-Stainless-OS", stainless_os)
+            .header("X-Stainless-Arch", &env.arch)
+            .header("X-Stainless-Runtime", "node")
+            .header("X-Stainless-Runtime-Version", &env.node_version)
+            .header("X-Stainless-Retry-Count", "0")
+            .header("X-Stainless-Timeout", "600")
             .json(&body)
             .send()
             .await
@@ -136,7 +166,7 @@ pub async fn fetch_usage(token: &str, proxy_url: &str) -> Result<Value, AppError
         .header("Accept", "application/json")
         .header("Content-Type", "application/json")
         .header("anthropic-beta", "oauth-2025-04-20")
-        .header("User-Agent", "claude-code/2.1.89 (external, cli)")
+        .header("User-Agent", "claude-code/2.1.81")
         .send()
         .await
         .map_err(|e| AppError::Internal(format!("usage request failed: {}", e)))?;

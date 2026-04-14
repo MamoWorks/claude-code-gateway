@@ -375,7 +375,7 @@ async fn test_account(
     };
     match state
         .token_tester
-        .test_token(&token, &account.proxy_url)
+        .test_token(&token, &account.proxy_url, &account.canonical_env)
         .await
     {
         Ok(()) => Ok(Json(serde_json::json!({"status": "ok"}))),

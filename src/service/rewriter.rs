@@ -86,7 +86,7 @@ fn beta_header_for_model(model_id: &str) -> &'static str {
     if lower.contains("haiku") {
         "oauth-2025-04-20,interleaved-thinking-2025-05-14"
     } else {
-        "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14"
+        "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05"
     }
 }
 
@@ -123,7 +123,7 @@ impl Rewriter {
             out.insert("Accept".into(), "application/json".into());
             out.insert(
                 "User-Agent".into(),
-                format!("claude-code/{} (external, cli)", version),
+                format!("claude-cli/{} (external, cli)", version),
             );
             out.insert(
                 "anthropic-beta".into(),
@@ -153,6 +153,7 @@ impl Rewriter {
             let session_id =
                 extract_session_id_from_body(body_map).unwrap_or_else(generate_session_uuid);
             out.insert("X-Claude-Code-Session-Id".into(), session_id);
+            out.insert("x-client-request-id".into(), generate_session_uuid());
         } else {
             // CC 客户端模式：白名单 + 改写
             let allowed: std::collections::HashSet<&str> = [
@@ -190,7 +191,7 @@ impl Rewriter {
                 let wire_key = resolve_wire_casing(k);
                 match lower.as_str() {
                     "user-agent" => {
-                        out.insert(wire_key, format!("claude-code/{} (external, cli)", version));
+                        out.insert(wire_key, format!("claude-cli/{} (external, cli)", version));
                     }
                     "x-stainless-os" => {
                         out.insert(wire_key, stainless_os.to_string());
@@ -384,10 +385,7 @@ impl Rewriter {
         }
 
         let session_id = generate_session_uuid();
-        let account_uuid = account
-            .account_uuid
-            .clone()
-            .unwrap_or_else(|| derive_account_uuid(account));
+        let account_uuid = account.account_uuid.clone().unwrap_or_default();
         let uid = serde_json::json!({
             "device_id": account.device_id,
             "account_uuid": account_uuid,
@@ -752,7 +750,7 @@ impl Rewriter {
 // --- 正则表达式 ---
 
 static PLATFORM_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"Platform:\s*\S+").unwrap());
-static SHELL_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"Shell:\s*\S+").unwrap());
+static SHELL_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"Shell:\s*[^\n<]+").unwrap());
 static OS_VERSION_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"OS Version:\s*[^\n<]+").unwrap());
 static WORKING_DIR_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"((?:Primary )?[Ww]orking directory:\s*)/\S+").unwrap());
@@ -871,29 +869,7 @@ where
 }
 
 fn build_canonical_env_map(env: &CanonicalEnvData) -> serde_json::Value {
-    serde_json::json!({
-        "platform": env.platform,
-        "platform_raw": env.platform_raw,
-        "arch": env.arch,
-        "node_version": env.node_version,
-        "terminal": env.terminal,
-        "package_managers": env.package_managers,
-        "runtimes": env.runtimes,
-        "is_running_with_bun": false,
-        "is_ci": false,
-        "is_claubbit": false,
-        "is_claude_code_remote": false,
-        "is_local_agent_mode": false,
-        "is_conductor": false,
-        "is_github_action": false,
-        "is_claude_code_action": false,
-        "is_claude_ai_auth": env.is_claude_ai_auth,
-        "version": env.version,
-        "version_base": env.version_base,
-        "build_time": env.build_time,
-        "deployment_environment": env.deployment_environment,
-        "vcs": env.vcs,
-    })
+    crate::model::identity::build_full_env_json(env)
 }
 
 // --- 进程指纹改写 ---
@@ -945,6 +921,20 @@ fn rewrite_process_fields(obj: &mut serde_json::Value, proc: &CanonicalProcessDa
             serde_json::json!(random_in_range(
                 proc.heap_used_range[0],
                 proc.heap_used_range[1]
+            )),
+        );
+        map.insert(
+            "external".into(),
+            serde_json::json!(random_in_range(
+                proc.external_range[0],
+                proc.external_range[1]
+            )),
+        );
+        map.insert(
+            "arrayBuffers".into(),
+            serde_json::json!(random_in_range(
+                proc.array_buffers_range[0],
+                proc.array_buffers_range[1]
             )),
         );
     }
