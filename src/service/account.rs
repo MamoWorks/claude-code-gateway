@@ -138,7 +138,12 @@ impl AccountService {
         if !session_hash.is_empty() {
             if let Ok(Some(account_id)) = self.cache.get_session_account_id(session_hash).await {
                 if account_id > 0 {
-                    if let Ok(account) = self.store.get_by_id(account_id).await {
+                    // Try the schedulable cache first; fall back to DB on miss.
+                    let account_opt = match self.store.get_schedulable_cached(account_id).await {
+                        Some(a) => Some(a),
+                        None => self.store.get_by_id(account_id).await.ok(),
+                    };
+                    if let Some(account) = account_opt {
                         let id_allowed =
                             allowed_ids.is_empty() || allowed_ids.contains(&account_id);
                         if account.is_schedulable()

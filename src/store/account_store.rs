@@ -3,18 +3,46 @@ use serde_json::Value;
 use sqlx::AnyPool;
 use sqlx::Row;
 use sqlx::any::AnyRow;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
 
 use crate::error::AppError;
 use crate::model::account::{Account, AccountStatus};
 
+const SCHEDULABLE_TTL: Duration = Duration::from_secs(30);
+
 pub struct AccountStore {
     pool: AnyPool,
     driver: String,
+    schedulable_cache: Arc<RwLock<Option<(Instant, Vec<Account>)>>>,
 }
 
 impl AccountStore {
     pub fn new(pool: AnyPool, driver: String) -> Self {
-        Self { pool, driver }
+        Self {
+            pool,
+            driver,
+            schedulable_cache: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    async fn invalidate_schedulable_cache(&self) {
+        let mut guard = self.schedulable_cache.write().await;
+        *guard = None;
+    }
+
+    /// Fast path for sticky-session lookups: find an account in the cached
+    /// schedulable list without hitting the DB. Returns None on cache miss
+    /// or expired cache.
+    pub async fn get_schedulable_cached(&self, id: i64) -> Option<Account> {
+        let guard = self.schedulable_cache.read().await;
+        if let Some((at, ref v)) = *guard {
+            if at.elapsed() < SCHEDULABLE_TTL {
+                return v.iter().find(|a| a.id == id).cloned();
+            }
+        }
+        None
     }
 
     fn now_expr(&self) -> &str {
@@ -252,6 +280,7 @@ impl AccountStore {
         a.id = row.try_get::<i64, _>("id").unwrap_or_default();
         a.created_at = Self::parse_time(&row, "created_at");
         a.updated_at = Self::parse_time(&row, "updated_at");
+        self.invalidate_schedulable_cache().await;
         Ok(())
     }
 
@@ -295,6 +324,7 @@ impl AccountStore {
             .bind(a.id)
             .execute(&self.pool)
             .await?;
+        self.invalidate_schedulable_cache().await;
         Ok(())
     }
 
@@ -321,6 +351,7 @@ impl AccountStore {
             .bind(id)
             .execute(&self.pool)
             .await?;
+        self.invalidate_schedulable_cache().await;
         Ok(())
     }
 
@@ -347,6 +378,7 @@ impl AccountStore {
             .bind(id)
             .execute(&self.pool)
             .await?;
+        self.invalidate_schedulable_cache().await;
         Ok(())
     }
 
@@ -391,6 +423,7 @@ impl AccountStore {
             .bind(id)
             .execute(&self.pool)
             .await?;
+        self.invalidate_schedulable_cache().await;
         Ok(())
     }
 
@@ -402,6 +435,7 @@ impl AccountStore {
             self.now_expr()
         );
         sqlx::query(&q).bind(id).execute(&self.pool).await?;
+        self.invalidate_schedulable_cache().await;
         Ok(())
     }
 
@@ -433,6 +467,7 @@ impl AccountStore {
             .bind(id)
             .execute(&self.pool)
             .await?;
+        self.invalidate_schedulable_cache().await;
         Ok(())
     }
 
@@ -509,6 +544,14 @@ impl AccountStore {
     }
 
     pub async fn list_schedulable(&self) -> Result<Vec<Account>, AppError> {
+        {
+            let guard = self.schedulable_cache.read().await;
+            if let Some((at, ref v)) = *guard {
+                if at.elapsed() < SCHEDULABLE_TTL {
+                    return Ok(v.clone());
+                }
+            }
+        }
         let q = format!(
             r#"SELECT {} FROM accounts
             WHERE status='active'
@@ -516,7 +559,12 @@ impl AccountStore {
             self.select_account_cols(),
         );
         let rows: Vec<AnyRow> = sqlx::query(&q).fetch_all(&self.pool).await?;
-        Ok(rows.iter().map(Self::row_to_account).collect())
+        let v: Vec<Account> = rows.iter().map(Self::row_to_account).collect();
+        {
+            let mut guard = self.schedulable_cache.write().await;
+            *guard = Some((Instant::now(), v.clone()));
+        }
+        Ok(v)
     }
 }
 
@@ -552,6 +600,7 @@ mod tests {
         AccountStore {
             pool,
             driver: driver.to_string(),
+            schedulable_cache: Arc::new(RwLock::new(None)),
         }
     }
 
