@@ -17,3 +17,4 @@
 *.pdb
 /cc-gateway
 /postgresql:
+/tests/

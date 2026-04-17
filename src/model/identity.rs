@@ -158,8 +158,8 @@ pub fn generate_canonical_identity() -> (String, Value, Value, Value) {
     let process = CanonicalProcessData {
         constrained_memory: mem,
         rss_range: [300_000_000, 500_000_000],
-        heap_total_range: [40_000_000, 80_000_000],
-        heap_used_range: [100_000_000, 200_000_000],
+        heap_total_range: [100_000_000, 200_000_000],
+        heap_used_range: [40_000_000, 80_000_000],
         external_range: [1_000_000, 3_000_000],
         array_buffers_range: [10_000, 50_000],
     };

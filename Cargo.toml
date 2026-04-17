@@ -59,6 +59,8 @@ tokio-socks = "0.5"
 # HTTP Client
 reqwest = { version = "=0.12.4", default-features = false, features = ["rustls-tls-manual-roots", "stream", "json", "socks"] }
 scopeguard = "1"
+futures-core = "0.3"
+pin-project-lite = "0.2"
 dotenvy = "0.15"
 
 # Utilities
@@ -68,3 +70,8 @@ rust-embed = "8"
 
 [patch.crates-io]
 rustls = { path = "craftls/rustls" }
+
+[dev-dependencies]
+futures-util = "0.3"
+async-stream = "0.3"
+bytes = "1"

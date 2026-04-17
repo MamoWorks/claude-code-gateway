@@ -321,14 +321,28 @@ fn build_tls_config() -> rustls::ClientConfig {
     config
 }
 
+/// 上游读取 idle 超时：两次 body 数据帧之间最多等这么久。
+/// - 流式 SSE：每来一个事件就重置，只要还在持续吐 event 就不会被切
+/// - 非流式：headers 到后 body 若 300s 内一个字节都没来视为上游卡死
+/// 与旧版 `.timeout(300)`（完整生命周期硬顶）的区别：不再因流持续时间长而误切
+const UPSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// 创建带 TLS 指纹伪装的 reqwest 客户端。
 /// 支持直连和代理（HTTP/SOCKS5）。
 pub fn make_request_client(proxy_url: &str) -> reqwest::Client {
+    make_request_client_with_read_timeout(proxy_url, UPSTREAM_READ_TIMEOUT)
+}
+
+/// 内部构造函数：暴露 read_timeout 参数给测试用短值验证 idle 语义。
+fn make_request_client_with_read_timeout(
+    proxy_url: &str,
+    read_timeout: Duration,
+) -> reqwest::Client {
     let tls_config = build_tls_config();
 
     let mut builder = reqwest::Client::builder()
         .use_preconfigured_tls(tls_config)
-        .timeout(Duration::from_secs(300))
+        .read_timeout(read_timeout)
         .no_proxy();
 
     if !proxy_url.is_empty() {
@@ -338,4 +352,186 @@ pub fn make_request_client(proxy_url: &str) -> reqwest::Client {
     }
 
     builder.build().unwrap_or_else(|_| reqwest::Client::new())
+}
+
+#[cfg(test)]
+mod tests {
+    //! 动态验证 `.read_timeout()` 的 idle 语义：
+    //! 真起一个本地 axum 服务器，按指定节奏吐 chunk；再用我们的 client 用短超时请求，
+    //! 观察"密集小 gap"是否能跨越总超时、"长 idle"是否触发超时。
+
+    use super::*;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::response::IntoResponse;
+    use axum::routing::get;
+    use bytes::Bytes;
+    use futures_util::StreamExt;
+    use std::convert::Infallible;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+    use tokio::time::Instant;
+
+    /// 在 127.0.0.1:随机端口启动一个 axum server：
+    /// - GET /stream?chunks=N&gap_ms=G  → 先立即吐 1 字节 header，再按 G ms 间隔吐 N 个 chunk
+    /// - GET /hang?gap_ms=G             → 吐 1 字节后无限等待
+    ///
+    /// 返回 (SocketAddr, 关闭信号的 sender)。drop sender 时 server 会优雅退出。
+    async fn spawn_server() -> (SocketAddr, oneshot::Sender<()>) {
+        async fn stream_handler(
+            axum::extract::Query(q): axum::extract::Query<
+                std::collections::HashMap<String, String>,
+            >,
+        ) -> impl IntoResponse {
+            let chunks: usize = q.get("chunks").and_then(|s| s.parse().ok()).unwrap_or(5);
+            let gap_ms: u64 = q.get("gap_ms").and_then(|s| s.parse().ok()).unwrap_or(50);
+            let stream = async_stream::stream! {
+                // 先吐一个引导字节，让 headers 立刻可读
+                yield Ok::<Bytes, Infallible>(Bytes::from_static(b"."));
+                for i in 0..chunks {
+                    tokio::time::sleep(Duration::from_millis(gap_ms)).await;
+                    let payload = format!("chunk-{}\n", i);
+                    yield Ok::<Bytes, Infallible>(Bytes::from(payload));
+                }
+            };
+            Body::from_stream(stream)
+        }
+
+        async fn hang_handler(
+            axum::extract::Query(q): axum::extract::Query<
+                std::collections::HashMap<String, String>,
+            >,
+        ) -> impl IntoResponse {
+            let pre_hang_gap: u64 = q
+                .get("pre_hang_gap_ms")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let stream = async_stream::stream! {
+                yield Ok::<Bytes, Infallible>(Bytes::from_static(b"start"));
+                if pre_hang_gap > 0 {
+                    tokio::time::sleep(Duration::from_millis(pre_hang_gap)).await;
+                    yield Ok::<Bytes, Infallible>(Bytes::from_static(b"second"));
+                }
+                // 永远挂着
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                yield Ok::<Bytes, Infallible>(Bytes::from_static(b"never"));
+            };
+            Body::from_stream(stream)
+        }
+
+        let app = Router::new()
+            .route("/stream", get(stream_handler))
+            .route("/hang", get(hang_handler));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let server = axum::serve(listener, app);
+            tokio::select! {
+                _ = server => {},
+                _ = rx => {},
+            }
+        });
+        (addr, tx)
+    }
+
+    /// 读取流并累计总字节，直到流结束或出错。返回 (字节数, 耗时, 错误)。
+    async fn drain_stream(
+        resp: reqwest::Response,
+    ) -> (usize, Duration, Option<reqwest::Error>) {
+        let start = Instant::now();
+        let mut total = 0usize;
+        let mut stream = resp.bytes_stream();
+        let mut err = None;
+        while let Some(r) = stream.next().await {
+            match r {
+                Ok(b) => total += b.len(),
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        (total, start.elapsed(), err)
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_does_not_fire_when_chunks_arrive_within_window() {
+        // read_timeout=300ms；server 每 50ms 吐 1 个，共 10 个，总耗时 ~500ms > timeout。
+        // 旧的 .timeout(300ms) 语义下会被切；新的 .read_timeout(300ms) 不应切。
+        let (addr, _stop) = spawn_server().await;
+        let client =
+            make_request_client_with_read_timeout("", Duration::from_millis(300));
+        let url = format!("http://{}/stream?chunks=10&gap_ms=50", addr);
+
+        let resp = client.get(&url).send().await.expect("headers ok");
+        assert!(resp.status().is_success());
+
+        let (bytes, elapsed, err) = drain_stream(resp).await;
+        assert!(err.is_none(), "idle 语义下流不应被切：err={:?}", err);
+        // 总字节应 > 引导字节的 1，证明 chunk 都收到了
+        assert!(
+            bytes > "chunk-0\n".len() * 5,
+            "chunk 到达数异常: bytes={}",
+            bytes
+        );
+        assert!(
+            elapsed >= Duration::from_millis(400),
+            "总耗时应 > 单 gap 许多倍，证明确实持续了 >300ms: elapsed={:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_fires_when_upstream_hangs() {
+        // read_timeout=150ms；server 吐第一个 chunk 后永远挂住。
+        // client 应收到第一个 chunk，然后在 ~150ms 后错误退出。
+        let (addr, _stop) = spawn_server().await;
+        let client =
+            make_request_client_with_read_timeout("", Duration::from_millis(150));
+        let url = format!("http://{}/hang", addr);
+
+        let resp = client.get(&url).send().await.expect("headers ok");
+        let (bytes, elapsed, err) = drain_stream(resp).await;
+
+        let err = err.expect("hang 后必须收到错误");
+        assert!(err.is_timeout() || format!("{:?}", err).to_lowercase().contains("time"),
+                "错误类型应为 timeout：{:?}", err);
+        // 第一个 chunk "start" = 5 字节 + 引导字节 "." = 6
+        assert!(bytes >= 1, "至少应收到首个引导/chunk: bytes={}", bytes);
+        // 触发时机：first frame 之后 ~150ms 内应被切
+        assert!(
+            elapsed >= Duration::from_millis(140) && elapsed <= Duration::from_millis(2000),
+            "超时应在 ~150ms 附近触发: elapsed={:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_resets_between_frames() {
+        // 更精细：read_timeout=200ms，gap=150ms，吐 8 个 chunk，总耗时 >1.2s。
+        // 每个 gap 都 < timeout；如果 reset 正常就能全收；如果没 reset 就早挂。
+        let (addr, _stop) = spawn_server().await;
+        let client =
+            make_request_client_with_read_timeout("", Duration::from_millis(200));
+        let url = format!("http://{}/stream?chunks=8&gap_ms=150", addr);
+
+        let resp = client.get(&url).send().await.expect("headers ok");
+        let (bytes, elapsed, err) = drain_stream(resp).await;
+
+        assert!(err.is_none(), "read_timeout 应在每个 frame 后 reset: err={:?}", err);
+        // 总耗时证明确实跨越了多个 timeout window（150ms*8 = 1.2s > 200ms 单窗）
+        assert!(
+            elapsed >= Duration::from_millis(1000),
+            "总耗时应 ~1.2s 证明 reset 生效: elapsed={:?}",
+            elapsed
+        );
+        assert!(bytes > 50, "应收到全部 chunk: bytes={}", bytes);
+
+        // 防止未使用变量告警
+        let _ = Arc::new(());
+    }
 }

@@ -19,29 +19,51 @@ async fn test_migrate_sqlite_creates_all_columns() {
         .await
         .expect("migrate failed");
 
-    let rows: Vec<sqlx::any::AnyRow> =
-        sqlx::query("PRAGMA table_info(accounts)")
-            .fetch_all(&pool)
-            .await
-            .expect("PRAGMA table_info failed");
+    let rows: Vec<sqlx::any::AnyRow> = sqlx::query("PRAGMA table_info(accounts)")
+        .fetch_all(&pool)
+        .await
+        .expect("PRAGMA table_info failed");
 
-    let col_names: Vec<String> = rows
-        .iter()
-        .map(|r| r.get::<String, _>("name"))
-        .collect();
+    let col_names: Vec<String> = rows.iter().map(|r| r.get::<String, _>("name")).collect();
 
     let expected = vec![
-        "id", "name", "email", "status", "token",
-        "auth_type", "access_token", "refresh_token",
-        "oauth_expires_at", "oauth_refreshed_at", "auth_error",
-        "proxy_url", "device_id",
-        "canonical_env", "canonical_prompt_env", "canonical_process",
-        "billing_mode", "concurrency", "priority",
-        "rate_limited_at", "rate_limit_reset_at",
-        "account_uuid", "organization_uuid", "subscription_type",
-        "disable_reason", "auto_telemetry", "telemetry_count",
-        "usage_data", "usage_fetched_at",
-        "created_at", "updated_at",
+        "id",
+        "name",
+        "email",
+        "status",
+        "token",
+        "auth_type",
+        "access_token",
+        "refresh_token",
+        "oauth_expires_at",
+        "oauth_refreshed_at",
+        "auth_error",
+        "proxy_url",
+        "device_id",
+        "canonical_env",
+        "canonical_prompt_env",
+        "canonical_process",
+        "billing_mode",
+        "concurrency",
+        "priority",
+        "rate_limited_at",
+        "rate_limit_reset_at",
+        "account_uuid",
+        "organization_uuid",
+        "subscription_type",
+        "disable_reason",
+        "auto_telemetry",
+        "telemetry_count",
+        "warmup_enabled",
+        "next_warmup_at",
+        "last_warmup_at",
+        "last_warmup_status",
+        "last_warmup_message",
+        "warmup_retry_count",
+        "usage_data",
+        "usage_fetched_at",
+        "created_at",
+        "updated_at",
     ];
 
     for col in &expected {
@@ -63,21 +85,22 @@ async fn test_migrate_sqlite_creates_token_table() {
         .await
         .expect("migrate failed");
 
-    let rows: Vec<sqlx::any::AnyRow> =
-        sqlx::query("PRAGMA table_info(api_tokens)")
-            .fetch_all(&pool)
-            .await
-            .expect("PRAGMA table_info failed");
+    let rows: Vec<sqlx::any::AnyRow> = sqlx::query("PRAGMA table_info(api_tokens)")
+        .fetch_all(&pool)
+        .await
+        .expect("PRAGMA table_info failed");
 
-    let col_names: Vec<String> = rows
-        .iter()
-        .map(|r| r.get::<String, _>("name"))
-        .collect();
+    let col_names: Vec<String> = rows.iter().map(|r| r.get::<String, _>("name")).collect();
 
     let expected = vec![
-        "id", "name", "token",
-        "allowed_accounts", "blocked_accounts",
-        "status", "created_at", "updated_at",
+        "id",
+        "name",
+        "token",
+        "allowed_accounts",
+        "blocked_accounts",
+        "status",
+        "created_at",
+        "updated_at",
     ];
 
     for col in &expected {
@@ -88,6 +111,30 @@ async fn test_migrate_sqlite_creates_token_table() {
             col_names
         );
     }
+}
+
+#[tokio::test]
+async fn test_migrate_sqlite_creates_settings_table_with_default() {
+    let pool = setup_pool().await;
+    claude_code_gateway::store::db::migrate(&pool, "sqlite")
+        .await
+        .expect("migrate failed");
+
+    let rows: Vec<sqlx::any::AnyRow> = sqlx::query("PRAGMA table_info(settings)")
+        .fetch_all(&pool)
+        .await
+        .expect("PRAGMA table_info failed");
+
+    let col_names: Vec<String> = rows.iter().map(|r| r.get::<String, _>("name")).collect();
+    assert!(col_names.contains(&"key".to_string()));
+    assert!(col_names.contains(&"value".to_string()));
+
+    let default_value = sqlx::query("SELECT value FROM settings WHERE key='quarantine_on_429'")
+        .fetch_one(&pool)
+        .await
+        .expect("default settings row missing")
+        .get::<String, _>("value");
+    assert_eq!(default_value, "true");
 }
 
 // ─── IDEMPOTENCY: running migrate twice should not error ───
@@ -108,7 +155,9 @@ async fn test_migrate_idempotent_sqlite() {
 #[tokio::test]
 async fn test_migrate_sqlite_account_crud() {
     use chrono::{Duration, Utc};
-    use claude_code_gateway::model::account::{Account, AccountAuthType, AccountStatus, BillingMode};
+    use claude_code_gateway::model::account::{
+        Account, AccountAuthType, AccountStatus, BillingMode,
+    };
     use claude_code_gateway::store::account_store::AccountStore;
 
     let pool = setup_pool().await;
@@ -147,6 +196,12 @@ async fn test_migrate_sqlite_account_crud() {
         disable_reason: String::new(),
         auto_telemetry: true,
         telemetry_count: 0,
+        warmup_enabled: false,
+        next_warmup_at: None,
+        last_warmup_at: None,
+        last_warmup_status: String::new(),
+        last_warmup_message: String::new(),
+        warmup_retry_count: 0,
         usage_data: serde_json::json!({}),
         usage_fetched_at: None,
         created_at: Utc::now(),

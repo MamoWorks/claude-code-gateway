@@ -22,13 +22,21 @@ const OAUTH_WAIT_ATTEMPTS: usize = 20;
 /// 用量利用率达到此阈值即视为“撞墙”。
 const USAGE_HIT_THRESHOLD: f64 = 97.0;
 /// 撞墙之外的纯速率限制的短冷却时间。
-const PURE_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
+const PURE_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 /// 无法确定限流原因时的保守限流时长（与历史行为一致）。
 const FALLBACK_QUARANTINE: Duration = Duration::from_secs(5 * 60 * 60);
 
 pub struct AccountService {
     store: Arc<AccountStore>,
     cache: Arc<dyn CacheStore>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitDisposition {
+    PureRateLimit,
+    FiveHourWall,
+    SevenDayWall,
+    Fallback,
 }
 
 impl AccountService {
@@ -165,6 +173,11 @@ impl AccountService {
     pub async fn release_slot(&self, account_id: i64) {
         let key = format!("concurrency:account:{}", account_id);
         self.cache.release_slot(&key).await;
+    }
+
+    pub fn slot_holder_for(&self, account_id: i64) -> crate::service::gateway::SlotHolder {
+        let key = format!("concurrency:account:{}", account_id);
+        crate::service::gateway::SlotHolder::new(self.cache.clone(), key)
     }
 
     /// 从 Anthropic API 获取账号用量并缓存到数据库。
@@ -313,18 +326,25 @@ impl AccountService {
         self.store.enable_account(id).await
     }
 
+    pub async fn clear_warmup_state(&self, id: i64) -> Result<(), AppError> {
+        self.store.clear_warmup_state(id).await
+    }
+
     /// 处理上游返回 429 的情况：根据账号类型和用量数据决定限流时长和原因。
     ///
     /// - **SetupToken**：无法查询用量接口，保守限流 5h（与历史行为一致）。
     /// - **OAuth**：立即拉取 `/api/oauth/usage` 判断是否撞墙：
     ///   - 命中 7 天墙 → 限流到周重置时间
     ///   - 命中 5 小时墙 → 限流到 5h 重置时间
-    ///   - 都没撞墙 → 纯速率限制，短冷却 1 分钟
+    ///   - 都没撞墙 → 纯速率限制，短冷却 5 分钟
     ///   - usage 接口调用失败 → 回退到 5h 保守限流
     ///
     /// Sonnet 7 天墙暂不纳入判断（上游可能只对 Sonnet 请求返回 429，不影响其他模型）。
-    pub async fn handle_rate_limit(&self, account: &Account) -> Result<(), AppError> {
-        let (reason, reset_at) = self.determine_rate_limit_window(account).await;
+    pub async fn handle_rate_limit(
+        &self,
+        account: &Account,
+    ) -> Result<RateLimitDisposition, AppError> {
+        let (disposition, reason, reset_at) = self.determine_rate_limit_window(account).await;
         warn!(
             "account {} rate limited ({}) until {}",
             account.id,
@@ -338,16 +358,18 @@ impl AccountService {
                 reason,
                 Some(reset_at),
             )
-            .await
+            .await?;
+        Ok(disposition)
     }
 
     async fn determine_rate_limit_window(
         &self,
         account: &Account,
-    ) -> (&'static str, chrono::DateTime<Utc>) {
+    ) -> (RateLimitDisposition, &'static str, chrono::DateTime<Utc>) {
         let now = Utc::now();
         let fallback = || {
             (
+                RateLimitDisposition::Fallback,
                 "429 速率限制",
                 now + chrono::Duration::from_std(FALLBACK_QUARANTINE).unwrap(),
             )
@@ -369,9 +391,14 @@ impl AccountService {
         };
 
         match classify_rate_limit(&usage, USAGE_HIT_THRESHOLD) {
-            Some(RateLimitWindow::SevenDay(reset_at)) => ("周限额已满", reset_at),
-            Some(RateLimitWindow::FiveHour(reset_at)) => ("5 小时限额已满", reset_at),
+            Some(RateLimitWindow::SevenDay(reset_at)) => {
+                (RateLimitDisposition::SevenDayWall, "周限额已满", reset_at)
+            }
+            Some(RateLimitWindow::FiveHour(reset_at)) => {
+                (RateLimitDisposition::FiveHourWall, "5 小时限额已满", reset_at)
+            }
             None => (
+                RateLimitDisposition::PureRateLimit,
                 "速率限制（未达用量墙）",
                 now + chrono::Duration::from_std(PURE_RATE_LIMIT_COOLDOWN).unwrap(),
             ),

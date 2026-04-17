@@ -4,6 +4,7 @@ use rand::Rng;
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use tracing::warn;
 
 use crate::model::account::{
     Account, BillingMode, CanonicalEnvData, CanonicalProcessData, CanonicalPromptEnvData,
@@ -61,33 +62,48 @@ pub enum ClientType {
 
 const DEFAULT_VERSION: &str = "2.1.81";
 
-/// 合并必需的 beta 令牌与客户端传入的 beta 令牌。
-fn merge_anthropic_beta(required: &str, incoming: &str) -> String {
-    let mut seen = std::collections::HashSet::new();
-    let mut tokens = Vec::new();
-    for t in required.split(',') {
-        let t = t.trim();
-        if !t.is_empty() && seen.insert(t.to_string()) {
-            tokens.push(t.to_string());
-        }
+/// 根据模型返回正确的 anthropic-beta 值。
+///
+/// 依据 Claude Code `src/utils/betas.ts` 对 firstParty provider 的规则复刻
+/// （cc-bridge 固定转发到 api.anthropic.com，即 firstParty + claudeAISubscriber）：
+///
+/// - `CLAUDE_CODE_20250219`: 仅非 Haiku 模型
+/// - `OAUTH_BETA_HEADER`   : 始终（claudeAISubscriber）
+/// - `INTERLEAVED_THINKING`: firstParty 规则 `!claude-3-*`
+/// - `REDACT_THINKING`     : 需 ISP 支持（等价于 `!claude-3-*`，默认交互式会话）
+/// - `CONTEXT_MANAGEMENT`  : Claude 4+ 模型（opus-4/sonnet-4/haiku-4）
+/// - `PROMPT_CACHING_SCOPE`: 始终（firstParty）
+pub fn compute_betas_for_model(model_id: &str) -> Vec<&'static str> {
+    let lower = model_id.to_lowercase();
+    let is_haiku = lower.contains("haiku");
+    let is_claude3 = lower.contains("claude-3-");
+    // firstParty: ISP 等价于 !claude-3-*（源码 betas.ts:107）
+    let supports_isp = !is_claude3;
+    // modelSupportsContextManagement: Claude 4+（源码 betas.ts:134-138）
+    let is_claude4_plus = lower.contains("claude-opus-4")
+        || lower.contains("claude-sonnet-4")
+        || lower.contains("claude-haiku-4");
+
+    let mut out: Vec<&'static str> = Vec::new();
+    if !is_haiku {
+        out.push("claude-code-20250219");
     }
-    for t in incoming.split(',') {
-        let t = t.trim();
-        if !t.is_empty() && seen.insert(t.to_string()) {
-            tokens.push(t.to_string());
-        }
+    // claudeAISubscriber → OAUTH_BETA_HEADER
+    out.push("oauth-2025-04-20");
+    if supports_isp {
+        out.push("interleaved-thinking-2025-05-14");
+        // REDACT_THINKING 取决于非交互/设置，代理默认发送交互态
+        out.push("redact-thinking-2026-02-12");
     }
-    tokens.join(",")
+    if is_claude4_plus {
+        out.push("context-management-2025-06-27");
+    }
+    out.push("prompt-caching-scope-2026-01-05");
+    out
 }
 
-/// 根据模型返回正确的 anthropic-beta 值。
-fn beta_header_for_model(model_id: &str) -> &'static str {
-    let lower = model_id.to_lowercase();
-    if lower.contains("haiku") {
-        "oauth-2025-04-20,interleaved-thinking-2025-05-14"
-    } else {
-        "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05"
-    }
+fn beta_header_for_model(model_id: &str) -> String {
+    compute_betas_for_model(model_id).join(",")
 }
 
 /// 处理所有请求的反检测改写。
@@ -212,11 +228,11 @@ impl Rewriter {
             out.entry("anthropic-dangerous-direct-browser-access".into())
                 .or_insert_with(|| "true".into());
 
-            // 合并客户端 beta 与必需 beta
-            let existing_beta = out.get("anthropic-beta").cloned().unwrap_or_default();
+            // CC 模式下忽略客户端自带 anthropic-beta，只发网关根据模型计算出的 beta。
+            // 这样可以避免新版客户端携带未受当前账号/认证方式支持的实验标记。
             out.insert(
                 "anthropic-beta".into(),
-                merge_anthropic_beta(beta_header_for_model(model_id), &existing_beta),
+                beta_header_for_model(model_id),
             );
         }
 
@@ -336,10 +352,29 @@ impl Rewriter {
         // 尝试 JSON 格式
         if let Ok(mut uid) = serde_json::from_str::<serde_json::Value>(&user_id_str) {
             if let Some(obj) = uid.as_object_mut() {
+                let account_uuid = account
+                    .account_uuid
+                    .clone()
+                    .unwrap_or_else(|| derive_account_uuid(account));
                 obj.insert(
                     "device_id".into(),
                     serde_json::Value::String(account.device_id.clone()),
                 );
+                obj.insert(
+                    "account_uuid".into(),
+                    serde_json::Value::String(account_uuid),
+                );
+                match &account.organization_uuid {
+                    Some(org) if !org.is_empty() => {
+                        obj.insert(
+                            "organization_uuid".into(),
+                            serde_json::Value::String(org.clone()),
+                        );
+                    }
+                    _ => {
+                        obj.remove("organization_uuid");
+                    }
+                }
                 let new_str = serde_json::to_string(&uid).unwrap_or_default();
                 if let Some(metadata) = body.get_mut("metadata").and_then(|m| m.as_object_mut()) {
                     metadata.insert("user_id".into(), serde_json::Value::String(new_str));
@@ -350,11 +385,17 @@ impl Rewriter {
 
         // 旧格式：user_{device}_account_{uuid}_session_{uuid}
         if let Some(idx) = user_id_str.find("_account_") {
-            let new_val = format!(
-                "user_{}_account_{}",
-                account.device_id,
-                &user_id_str[idx + 9..]
-            );
+            let after_account = &user_id_str[idx + 9..];
+            let account_uuid = account
+                .account_uuid
+                .clone()
+                .unwrap_or_else(|| derive_account_uuid(account));
+            let account_suffix = if let Some(session_idx) = after_account.find("_session_") {
+                format!("{}{}", account_uuid, &after_account[session_idx..])
+            } else {
+                account_uuid
+            };
+            let new_val = format!("user_{}_account_{}", account.device_id, account_suffix);
             if let Some(metadata) = body.get_mut("metadata").and_then(|m| m.as_object_mut()) {
                 metadata.insert("user_id".into(), serde_json::Value::String(new_val));
             }
@@ -564,6 +605,73 @@ impl Rewriter {
         if let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
             for msg in messages.iter_mut() {
                 rewrite_message_content(msg, &rewrite_in_reminders);
+            }
+        }
+
+        // Rewrite 模式下兜底补 billing line 占位符，避免老客户端缺失该行时
+        // 无法在序列化后计算 cch attestation。
+        if *billing_mode == BillingMode::Rewrite {
+            let has_placeholder = body
+                .get("system")
+                .map(|sys| match sys {
+                    serde_json::Value::String(s) => s.contains("cch=00000"),
+                    serde_json::Value::Array(arr) => arr.iter().any(|block| {
+                        block
+                            .get("text")
+                            .and_then(|t| t.as_str())
+                            .map(|text| text.contains("cch=00000"))
+                            .unwrap_or(false)
+                    }),
+                    _ => false,
+                })
+                .unwrap_or(false);
+
+            if !has_placeholder {
+                warn!("CC request missing billing line, injecting billing placeholder");
+                let billing_line = format!(
+                    "x-anthropic-billing-header: cc_version={}.{};cc_entrypoint=cli;cch=00000\n",
+                    version, cch_hash
+                );
+
+                match body.get_mut("system") {
+                    Some(serde_json::Value::String(s)) => {
+                        let old = s.clone();
+                        *s = format!("{}{}", billing_line, old);
+                    }
+                    Some(serde_json::Value::Array(arr)) => {
+                        let mut injected = false;
+                        for block in arr.iter_mut() {
+                            if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                let old = block
+                                    .get("text")
+                                    .and_then(|t| t.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                block.as_object_mut().unwrap().insert(
+                                    "text".into(),
+                                    serde_json::Value::String(format!("{}{}", billing_line, old)),
+                                );
+                                injected = true;
+                                break;
+                            }
+                        }
+                        if !injected {
+                            arr.insert(
+                                0,
+                                serde_json::json!({
+                                    "type": "text",
+                                    "text": billing_line.trim_end(),
+                                }),
+                            );
+                        }
+                    }
+                    _ => {
+                        body.as_object_mut().unwrap().insert(
+                            "system".into(),
+                            serde_json::Value::String(billing_line.trim_end().to_string()),
+                        );
+                    }
+                }
             }
         }
     }
@@ -1197,4 +1305,75 @@ fn nth_index(s: &str, c: char, n: usize) -> Option<usize> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod beta_tests {
+    use super::compute_betas_for_model;
+
+    fn contains(set: &[&str], s: &str) -> bool {
+        set.iter().any(|x| *x == s)
+    }
+
+    #[test]
+    fn sonnet_4_5_gets_full_first_party_set() {
+        let b = compute_betas_for_model("claude-sonnet-4-5-20250929");
+        assert!(contains(&b, "claude-code-20250219"));
+        assert!(contains(&b, "oauth-2025-04-20"));
+        assert!(contains(&b, "interleaved-thinking-2025-05-14"));
+        assert!(contains(&b, "redact-thinking-2026-02-12"));
+        assert!(contains(&b, "context-management-2025-06-27"));
+        assert!(contains(&b, "prompt-caching-scope-2026-01-05"));
+    }
+
+    #[test]
+    fn opus_4_6_gets_full_first_party_set() {
+        let b = compute_betas_for_model("claude-opus-4-6");
+        assert!(contains(&b, "claude-code-20250219"));
+        assert!(contains(&b, "context-management-2025-06-27"));
+        assert!(contains(&b, "prompt-caching-scope-2026-01-05"));
+    }
+
+    #[test]
+    fn haiku_4_5_excludes_claude_code_but_keeps_isp_and_context_mgmt() {
+        let b = compute_betas_for_model("claude-haiku-4-5");
+        // Haiku 分支不发 claude-code-20250219
+        assert!(!contains(&b, "claude-code-20250219"));
+        // 但仍支持 ISP / context management / prompt-caching-scope
+        assert!(contains(&b, "interleaved-thinking-2025-05-14"));
+        assert!(contains(&b, "redact-thinking-2026-02-12"));
+        assert!(contains(&b, "context-management-2025-06-27"));
+        assert!(contains(&b, "prompt-caching-scope-2026-01-05"));
+        assert!(contains(&b, "oauth-2025-04-20"));
+    }
+
+    #[test]
+    fn haiku_3_5_strips_isp_and_context_mgmt() {
+        let b = compute_betas_for_model("claude-3-5-haiku-20241022");
+        assert!(!contains(&b, "claude-code-20250219"));
+        // claude-3-* 不支持 ISP（源码 betas.ts:107）
+        assert!(!contains(&b, "interleaved-thinking-2025-05-14"));
+        assert!(!contains(&b, "redact-thinking-2026-02-12"));
+        // Claude 3 不支持 context-management
+        assert!(!contains(&b, "context-management-2025-06-27"));
+        // OAuth + prompt-caching-scope 仍存在
+        assert!(contains(&b, "oauth-2025-04-20"));
+        assert!(contains(&b, "prompt-caching-scope-2026-01-05"));
+    }
+
+    #[test]
+    fn claude_3_opus_behaves_as_legacy() {
+        let b = compute_betas_for_model("claude-3-opus-20240229");
+        assert!(contains(&b, "claude-code-20250219")); // 非 haiku
+        assert!(!contains(&b, "interleaved-thinking-2025-05-14"));
+        assert!(!contains(&b, "context-management-2025-06-27"));
+        assert!(contains(&b, "prompt-caching-scope-2026-01-05"));
+    }
+
+    #[test]
+    fn ordering_is_stable_across_calls() {
+        let a = compute_betas_for_model("claude-sonnet-4-5");
+        let b = compute_betas_for_model("claude-sonnet-4-5");
+        assert_eq!(a, b);
+    }
 }
