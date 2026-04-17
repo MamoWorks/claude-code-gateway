@@ -157,16 +157,36 @@ impl AccountService {
 
         // 获取可调度账号
         let accounts = self.store.list_schedulable().await?;
+        let total_schedulable = accounts.len();
 
         // 过滤：排除项 + 可用账号限制 + 限流状态（内存热态）
+        let mut limited_out: Vec<i64> = Vec::new();
         let candidates: Vec<Account> = accounts
             .into_iter()
             .filter(|a| {
-                !exclude_ids.contains(&a.id)
-                    && (allowed_ids.is_empty() || allowed_ids.contains(&a.id))
-                    && self.limit_store.availability(a.id).is_available()
+                if exclude_ids.contains(&a.id) {
+                    return false;
+                }
+                if !(allowed_ids.is_empty() || allowed_ids.contains(&a.id)) {
+                    return false;
+                }
+                let availability = self.limit_store.availability(a.id);
+                if !availability.is_available() {
+                    limited_out.push(a.id);
+                    return false;
+                }
+                true
             })
             .collect();
+
+        if !limited_out.is_empty() {
+            info!(
+                "select: {} of {} schedulable accounts filtered by limit state: {:?}",
+                limited_out.len(),
+                total_schedulable,
+                limited_out
+            );
+        }
 
         if candidates.is_empty() {
             return Err(AppError::ServiceUnavailable("no available accounts".into()));

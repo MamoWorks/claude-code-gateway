@@ -73,12 +73,30 @@ export interface PagedResult<T> {
 export interface UsageWindow {
   utilization: number
   resets_at: string
+  /** 每窗口独立状态：allowed / allowed_warning / rejected。响应头源才有，/api/oauth/usage 缺失。 */
+  status?: string
+  /** 上游在撞墙前发出的阈值（0-1），通常 0.8 / 0.9 / 0.97。 */
+  surpassed_threshold?: number
 }
 
 export interface UsageData {
   five_hour?: UsageWindow
   seven_day?: UsageWindow
   seven_day_sonnet?: UsageWindow
+  /** 数据来源：'headers'（响应头吸取）/ undefined（/api/oauth/usage 旧数据）。 */
+  source?: string
+  /** 全局状态（所有窗口中最紧张的）。 */
+  status?: string
+  /** 上游标记的瓶颈窗口：'five_hour' / 'seven_day' / 'seven_day_opus'。 */
+  representative_claim?: string
+  /** 全局 -reset 头，瓶颈窗口的重置时刻。 */
+  resets_at?: string
+  /** 回退配额百分比。 */
+  fallback_percentage?: number
+  /** Overage（超量付费）状态：allowed / allowed_warning / rejected。 */
+  overage_status?: string
+  /** Overage 被禁用的原因（如 org_level_disabled）。 */
+  overage_disabled_reason?: string
 }
 
 export interface ApiToken {

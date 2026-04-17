@@ -414,6 +414,20 @@ impl AccountStore {
         Ok(())
     }
 
+    /// 一次性清理：Phase 1 前由旧限流路径写入 status='active' 账号上的残留字段。
+    /// 手动停用（status='disabled'）的账号不动。幂等：清完后二次运行无副作用。
+    pub async fn clear_stale_rate_limit_fields(&self) -> Result<u64, AppError> {
+        let q = format!(
+            r#"UPDATE accounts
+               SET rate_limited_at=NULL, rate_limit_reset_at=NULL, disable_reason='',
+                   updated_at={}
+               WHERE status='active' AND rate_limited_at IS NOT NULL"#,
+            self.now_expr()
+        );
+        let rows = sqlx::query(&q).execute(&self.pool).await?.rows_affected();
+        Ok(rows)
+    }
+
     pub async fn delete(&self, id: i64) -> Result<(), AppError> {
         sqlx::query("DELETE FROM accounts WHERE id=$1")
             .bind(id)

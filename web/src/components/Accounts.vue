@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue';
-import { api, type Account, type OAuthExchangeResult } from '../api';
+import { api, type Account, type OAuthExchangeResult, type UsageData } from '../api';
 import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -347,6 +347,31 @@ function usageBarColor(pct: number): string {
 }
 
 /**
+ * 用量徽章行是否需要展示（任一徽章字段存在即展示）。
+ */
+function usageHasBadges(ud?: UsageData | null): boolean {
+  if (!ud) return false;
+  return !!(
+    (ud.status && ud.status !== 'allowed') ||
+    ud.overage_status === 'rejected' ||
+    ud.source === 'headers'
+  );
+}
+
+/**
+ * 瓶颈窗口标识转可读中文。
+ */
+function formatClaim(claim: string): string {
+  switch (claim) {
+    case 'five_hour': return '5 小时';
+    case 'seven_day': return '7 天';
+    case 'seven_day_opus': return '7 天 Opus';
+    case 'seven_day_sonnet': return '7 天 Sonnet';
+    default: return claim;
+  }
+}
+
+/**
  * 判断账号是否正在被限流
  */
 function isRateLimited(a: Account): boolean {
@@ -672,10 +697,38 @@ async function copyText(text: string) {
               </p>
               <p v-else class="text-[10px] text-[#b5b0a6]">未刷新</p>
             </div>
+            <!-- 状态徽章行：全局 status / overage / 瓶颈 / 数据源 -->
+            <div v-if="usageHasBadges(a.usage_data)" class="flex flex-wrap gap-1">
+              <span v-if="a.usage_data?.status && a.usage_data.status !== 'allowed'"
+                class="px-1.5 py-0.5 rounded text-[10px] font-medium"
+                :class="a.usage_data.status === 'rejected' ? 'bg-red-50 text-red-600' : 'bg-amber-50 text-amber-700'">
+                {{ a.usage_data.status === 'rejected' ? '已拒绝' : '预警' }}
+              </span>
+              <span v-if="a.usage_data?.representative_claim && a.usage_data?.status !== 'allowed'"
+                class="px-1.5 py-0.5 rounded text-[10px] font-medium bg-orange-50 text-orange-600">
+                瓶颈: {{ formatClaim(a.usage_data.representative_claim) }}
+              </span>
+              <span v-if="a.usage_data?.overage_status === 'rejected'"
+                class="px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-50 text-slate-500"
+                :title="a.usage_data?.overage_disabled_reason || ''">
+                Overage 禁用
+              </span>
+              <span v-if="a.usage_data?.source === 'headers'"
+                class="px-1.5 py-0.5 rounded text-[10px] font-medium bg-emerald-50 text-emerald-600"
+                title="数据来自响应头（实时）">
+                实时
+              </span>
+            </div>
             <!-- 5 小时 -->
             <div class="space-y-0.5">
               <div class="flex justify-between text-[11px]">
-                <span class="text-[#8c8475]">5 小时</span>
+                <span class="text-[#8c8475] flex items-center gap-1">
+                  5 小时
+                  <span v-if="a.usage_data?.five_hour?.status && a.usage_data.five_hour.status !== 'allowed'"
+                    class="inline-block w-1.5 h-1.5 rounded-full"
+                    :class="a.usage_data.five_hour.status === 'rejected' ? 'bg-red-500' : 'bg-amber-500'"
+                    :title="a.usage_data.five_hour.status" />
+                </span>
                 <span class="text-[#5c5647] font-medium">{{ a.usage_data?.five_hour ? Math.round(a.usage_data.five_hour.utilization) : '0' }}%
                   <span v-if="a.usage_data?.five_hour" class="text-[#b5b0a6] font-normal">· {{ formatTimeLeft(a.usage_data.five_hour.resets_at) }}</span>
                 </span>
@@ -689,7 +742,13 @@ async function copyText(text: string) {
             <!-- 7 天 -->
             <div class="space-y-0.5">
               <div class="flex justify-between text-[11px]">
-                <span class="text-[#8c8475]">7 天</span>
+                <span class="text-[#8c8475] flex items-center gap-1">
+                  7 天
+                  <span v-if="a.usage_data?.seven_day?.status && a.usage_data.seven_day.status !== 'allowed'"
+                    class="inline-block w-1.5 h-1.5 rounded-full"
+                    :class="a.usage_data.seven_day.status === 'rejected' ? 'bg-red-500' : 'bg-amber-500'"
+                    :title="a.usage_data.seven_day.status" />
+                </span>
                 <span class="text-[#5c5647] font-medium">{{ a.usage_data?.seven_day ? Math.round(a.usage_data.seven_day.utilization) : '0' }}%
                   <span v-if="a.usage_data?.seven_day" class="text-[#b5b0a6] font-normal">· {{ formatTimeLeft(a.usage_data.seven_day.resets_at) }}</span>
                 </span>

@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::error::AppError;
 use crate::store::account_store::AccountStore;
@@ -137,11 +137,35 @@ impl LimitStore {
         let mut new_state = apply_parsed(prev.clone(), parsed);
         new_state.updated_at = Some(Instant::now());
 
-        let should_flush = decide_flush(&prev, &new_state);
-        if should_flush {
+        let flush_r = flush_reason(&prev, &new_state);
+        if let Some(reason) = flush_r {
             // 抢先占位：即使 flush 失败也先记，下次 5min 后再尝试，避免连续失败造成风暴。
             new_state.last_db_flush_at = Some(Instant::now());
+            let five = new_state
+                .five_hour
+                .as_ref()
+                .map(|w| w.utilization)
+                .unwrap_or(0.0);
+            let seven = new_state
+                .seven_day
+                .as_ref()
+                .map(|w| w.utilization)
+                .unwrap_or(0.0);
+            info!(
+                "limit absorb: account {} → flush ({}) 5h={:.1}% 7d={:.1}% status={}",
+                account_id,
+                reason,
+                five * 100.0,
+                seven * 100.0,
+                new_state.status.unwrap_or(UnifiedStatus::Allowed).as_str(),
+            );
+        } else {
+            debug!(
+                "limit absorb: account {} → no flush (within TTL, no threshold event)",
+                account_id
+            );
         }
+        let should_flush = flush_r.is_some();
         map.insert(account_id, new_state);
         should_flush
     }
@@ -155,20 +179,38 @@ impl LimitStore {
         judge_availability(state)
     }
 
-    /// flush 当前内存状态到 DB 的 `accounts.usage_data` 列。
+    /// flush 当前内存状态到 DB：
+    /// 1. `usage_data` JSON（完整快照，供 UI 读）
+    /// 2. `rate_limit_reset_at` / `rate_limited_at`：
+    ///    任一窗口 util >= 97% 且 resets_at 未来 → 写入最晚的 resets_at；
+    ///    否则清空这两列。
+    ///
     /// 由 gateway 在 absorb_headers 返回 true 时 tokio::spawn 调用。
     pub async fn flush_to_db(&self, account_id: i64) -> Result<(), AppError> {
-        let json = {
+        let (json, limit_until) = {
             let map = self.states.lock().unwrap();
             let Some(state) = map.get(&account_id) else {
                 debug!("limit flush: account {} not in memory, skip", account_id);
                 return Ok(());
             };
-            build_usage_json(state)
+            (build_usage_json(state), bottleneck_limit_until(state))
         };
         let json_str = serde_json::to_string(&json).unwrap_or_else(|_| "{}".into());
         self.store.update_usage(account_id, &json_str).await?;
-        debug!("limit flush: account {} → DB", account_id);
+        match limit_until {
+            Some(reset_at) => {
+                self.store.set_rate_limit(account_id, reset_at).await?;
+                debug!(
+                    "limit flush: account {} → DB (limited until {})",
+                    account_id,
+                    reset_at.to_rfc3339()
+                );
+            }
+            None => {
+                self.store.clear_rate_limit(account_id).await?;
+                debug!("limit flush: account {} → DB (cleared)", account_id);
+            }
+        }
         Ok(())
     }
 
@@ -328,37 +370,37 @@ fn apply_parsed(mut state: LimitState, parsed: ParsedHeaders) -> LimitState {
     state
 }
 
-/// 判定是否需要 flush 到 DB。
-fn decide_flush(prev: &LimitState, new: &LimitState) -> bool {
+/// 判定是否需要 flush 到 DB；返回 Some(reason) 触发，None 不触发。
+fn flush_reason(prev: &LimitState, new: &LimitState) -> Option<&'static str> {
     // 1) 首次填充
     if prev.last_db_flush_at.is_none() {
-        return true;
+        return Some("first-fill");
     }
     // 2) TTL 到期
     if let Some(last) = prev.last_db_flush_at {
         if last.elapsed() >= DB_FLUSH_TTL {
-            return true;
+            return Some("ttl-expired");
         }
     }
     // 3) 全局状态从 Allowed 切走
     let prev_status = prev.status.unwrap_or(UnifiedStatus::Allowed);
     let new_status = new.status.unwrap_or(UnifiedStatus::Allowed);
     if prev_status == UnifiedStatus::Allowed && new_status != UnifiedStatus::Allowed {
-        return true;
+        return Some("status-changed");
     }
     // 4) 任一窗口 utilization 跨过 97%
     if crossed_threshold(&prev.five_hour, &new.five_hour, HIT_THRESHOLD)
         || crossed_threshold(&prev.seven_day, &new.seven_day, HIT_THRESHOLD)
     {
-        return true;
+        return Some("threshold-crossed-97pct");
     }
     // 5) 任一窗口新出现 surpassed-threshold 头
     if newly_surpassed(&prev.five_hour, &new.five_hour)
         || newly_surpassed(&prev.seven_day, &new.seven_day)
     {
-        return true;
+        return Some("surpassed-threshold");
     }
-    false
+    None
 }
 
 fn crossed_threshold(
@@ -377,8 +419,21 @@ fn newly_surpassed(prev: &Option<WindowSnapshot>, new: &Option<WindowSnapshot>) 
     new_has && !prev_has
 }
 
+/// 返回"瓶颈窗口"的 resets_at（用于 DB 列 rate_limit_reset_at）：
+/// 若任一窗口 util >= 97% 且 resets_at 在未来，返回这些窗口中最晚的 resets_at；
+/// 否则返回 None（上层会 clear_rate_limit）。
+fn bottleneck_limit_until(state: &LimitState) -> Option<DateTime<Utc>> {
+    let now = Utc::now();
+    let mut picks: Vec<DateTime<Utc>> = Vec::new();
+    for w in [&state.five_hour, &state.seven_day].into_iter().flatten() {
+        if w.utilization >= HIT_THRESHOLD && w.resets_at > now {
+            picks.push(w.resets_at);
+        }
+    }
+    picks.into_iter().max()
+}
+
 fn judge_availability(state: &LimitState) -> Availability {
-    // 任一窗口撞墙（>= 97% 且 reset 未来）→ 不可用
     if let Some(w) = &state.five_hour {
         if w.utilization >= HIT_THRESHOLD && w.resets_at > Utc::now() {
             return Availability::Unavailable {
@@ -536,7 +591,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(decide_flush(&prev, &new));
+        assert!(flush_reason(&prev, &new).is_some());
     }
 
     #[test]
@@ -562,7 +617,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(!decide_flush(&prev, &new));
+        assert!(flush_reason(&prev, &new).is_none());
     }
 
     #[test]
@@ -588,7 +643,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(decide_flush(&prev, &new));
+        assert!(flush_reason(&prev, &new).is_some());
     }
 
     #[test]
@@ -604,7 +659,7 @@ mod tests {
             status: Some(UnifiedStatus::AllowedWarning),
             ..Default::default()
         };
-        assert!(decide_flush(&prev, &new));
+        assert!(flush_reason(&prev, &new).is_some());
     }
 
     #[test]
@@ -669,9 +724,83 @@ mod tests {
         assert!(judge_availability(&state).is_available());
     }
 
+    // ---- bottleneck_limit_until ----
+
     #[test]
-    fn build_usage_json_converts_to_0_100_scale() {
+    fn bottleneck_none_when_all_below_97() {
         let state = LimitState {
+            five_hour: Some(WindowSnapshot {
+                utilization: 0.14,
+                resets_at: Utc::now() + chrono::Duration::hours(2),
+                status: UnifiedStatus::Allowed,
+                surpassed_threshold: None,
+            }),
+            ..Default::default()
+        };
+        assert!(bottleneck_limit_until(&state).is_none());
+    }
+
+    #[test]
+    fn bottleneck_picks_five_hour_when_only_5h_over() {
+        let five_reset = Utc::now() + chrono::Duration::hours(2);
+        let state = LimitState {
+            five_hour: Some(WindowSnapshot {
+                utilization: 0.98,
+                resets_at: five_reset,
+                status: UnifiedStatus::AllowedWarning,
+                surpassed_threshold: None,
+            }),
+            seven_day: Some(WindowSnapshot {
+                utilization: 0.30,
+                resets_at: Utc::now() + chrono::Duration::days(5),
+                status: UnifiedStatus::Allowed,
+                surpassed_threshold: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(bottleneck_limit_until(&state), Some(five_reset));
+    }
+
+    #[test]
+    fn bottleneck_picks_later_when_both_over() {
+        // 两个窗口都撞墙时，取更晚的 resets_at（限流更久）
+        let five_reset = Utc::now() + chrono::Duration::hours(2);
+        let seven_reset = Utc::now() + chrono::Duration::days(5);
+        let state = LimitState {
+            five_hour: Some(WindowSnapshot {
+                utilization: 0.98,
+                resets_at: five_reset,
+                status: UnifiedStatus::Rejected,
+                surpassed_threshold: None,
+            }),
+            seven_day: Some(WindowSnapshot {
+                utilization: 0.99,
+                resets_at: seven_reset,
+                status: UnifiedStatus::Rejected,
+                surpassed_threshold: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(bottleneck_limit_until(&state), Some(seven_reset));
+    }
+
+    #[test]
+    fn bottleneck_skips_past_reset() {
+        // 即使 util >= 97%，reset 已过去视为已重置
+        let state = LimitState {
+            five_hour: Some(WindowSnapshot {
+                utilization: 0.99,
+                resets_at: Utc::now() - chrono::Duration::hours(1),
+                status: UnifiedStatus::Allowed,
+                surpassed_threshold: None,
+            }),
+            ..Default::default()
+        };
+        assert!(bottleneck_limit_until(&state).is_none());
+    }
+
+    #[test]
+    fn build_usage_json_converts_to_0_100_scale() {        let state = LimitState {
             five_hour: Some(WindowSnapshot {
                 utilization: 0.14,
                 resets_at: DateTime::from_timestamp(1776427200, 0).unwrap(),

@@ -72,6 +72,14 @@ async fn main() {
         driver.clone(),
     ));
 
+    // 一次性清理：Phase 1 之前旧限流路径写入的残留字段（status='active' 账号上的
+    // rate_limited_at / rate_limit_reset_at / disable_reason）。幂等，每次启动执行。
+    match account_store.clear_stale_rate_limit_fields().await {
+        Ok(n) if n > 0 => tracing::info!("cleared stale rate-limit fields on {} account(s)", n),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("clear stale rate-limit fields failed: {}", e),
+    }
+
     let limit_store = Arc::new(service::limit::LimitStore::new(account_store.clone()));
     let account_svc = Arc::new(service::account::AccountService::new(
         account_store.clone(),
