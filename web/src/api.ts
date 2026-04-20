@@ -97,6 +97,10 @@ export interface UsageData {
   overage_status?: string
   /** Overage 被禁用的原因（如 org_level_disabled）。 */
   overage_disabled_reason?: string
+  /** 账号级短期 429 ban 截止时刻（两模型都受影响）。 */
+  rate_limited_until?: string
+  /** Sonnet 专属短期 429 ban 截止时刻（只挡 Sonnet）。 */
+  sonnet_rate_limited_until?: string
 }
 
 export interface ApiToken {

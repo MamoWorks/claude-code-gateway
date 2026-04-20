@@ -185,18 +185,18 @@ impl GatewayService {
 
         // Sonnet 请求旁路：让本地限流状态不拦截 Sonnet，由 Anthropic 自己拒。
         // 约定：request body 里 model 字段含 "sonnet"（大小写不敏感）即认定为 Sonnet。
-        let is_sonnet_request = body_map
+        let model_id_for_class = body_map
             .get("model")
             .and_then(|m| m.as_str())
-            .map(|m| m.to_ascii_lowercase().contains("sonnet"))
-            .unwrap_or(false);
+            .unwrap_or("");
+        let model_class = crate::service::limit::ModelClass::from_model_id(model_id_for_class);
 
         // 黏性透传策略：429 不再 retry 其它账号（换号会 bust prompt cache，成本爆炸）。
         // 本次请求拿到 429 → 包装成通用错误 body 返回；后续并发请求由 absorb_headers
         // 更新的 state.status / rate_limited_until 让 selector 自然避开此账号。
         let account = match self
             .account_svc
-            .select_account(&session_hash, &blocked_ids, &allowed_ids, is_sonnet_request)
+            .select_account(&session_hash, &blocked_ids, &allowed_ids, model_class)
             .await
         {
             Ok(a) => a,
@@ -298,6 +298,7 @@ impl GatewayService {
                 &account,
                 slot,
                 &rid,
+                model_class,
             )
             .await?;
         cp!("forward_done");
@@ -346,6 +347,7 @@ impl GatewayService {
         account: &Account,
         slot: SlotHolder,
         rid: &str,
+        model_class: crate::service::limit::ModelClass,
     ) -> Result<Response, AppError> {
         let mut target_url = format!("{}{}", UPSTREAM_BASE, path);
         if !query.is_empty() {
@@ -408,7 +410,7 @@ impl GatewayService {
         // 对空闲 2xx 响应且无 unified-* 字段：无副作用直接 return false。
         // 对 429 响应：即使无 unified-* 字段也会设短期隔离（retry-after 或默认 60s），避免并发请求反复撞同一账号。
         let absorb_t0 = Instant::now();
-        let should_flush = self.limit_store.absorb_headers(account.id, status_code, resp.headers());
+        let should_flush = self.limit_store.absorb_headers(account.id, model_class, status_code, resp.headers());
         if should_flush {
             let ls = self.limit_store.clone();
             let aid = account.id;

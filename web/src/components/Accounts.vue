@@ -359,6 +359,33 @@ function usageHasBadges(ud?: UsageData | null): boolean {
 }
 
 /**
+ * 账号级自动限流判定（两模型都受影响）：
+ * status=rejected / 5h≥97% / 7d≥97% / rate_limited_until 未过期。
+ */
+function isOpusAutoLimited(a: Account): boolean {
+  const u = a.usage_data;
+  if (!u) return false;
+  if (u.status === 'rejected') return true;
+  if ((u.five_hour?.utilization ?? 0) >= 97) return true;
+  if ((u.seven_day?.utilization ?? 0) >= 97) return true;
+  if (u.rate_limited_until && new Date(u.rate_limited_until) > new Date()) return true;
+  return false;
+}
+
+/**
+ * Sonnet 自动限流判定：账号级受限 OR Sonnet 专属受限
+ * （seven_day_sonnet≥97% / sonnet_rate_limited_until 未过期）。
+ */
+function isSonnetAutoLimited(a: Account): boolean {
+  if (isOpusAutoLimited(a)) return true;
+  const u = a.usage_data;
+  if (!u) return false;
+  if ((u.seven_day_sonnet?.utilization ?? 0) >= 97) return true;
+  if (u.sonnet_rate_limited_until && new Date(u.sonnet_rate_limited_until) > new Date()) return true;
+  return false;
+}
+
+/**
  * 瓶颈窗口标识转可读中文。
  */
 function formatClaim(claim: string): string {
@@ -697,8 +724,16 @@ async function copyText(text: string) {
               </p>
               <p v-else class="text-[10px] text-[#b5b0a6]">未刷新</p>
             </div>
-            <!-- 状态徽章行：全局 status / overage / 瓶颈 / 数据源 -->
-            <div v-if="usageHasBadges(a.usage_data)" class="flex flex-wrap gap-1">
+            <!-- 状态徽章行：Opus/Sonnet 自动限流 / 全局 status / overage / 瓶颈 / 数据源 -->
+            <div v-if="usageHasBadges(a.usage_data) || isOpusAutoLimited(a) || isSonnetAutoLimited(a)" class="flex flex-wrap gap-1">
+              <span v-if="isOpusAutoLimited(a)"
+                class="px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-50 text-amber-700 border border-amber-200">
+                Opus 自动限流中
+              </span>
+              <span v-if="isSonnetAutoLimited(a)"
+                class="px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-50 text-amber-700 border border-amber-200">
+                Sonnet 自动限流中
+              </span>
               <span v-if="a.usage_data?.status && a.usage_data.status !== 'allowed'"
                 class="px-1.5 py-0.5 rounded text-[10px] font-medium"
                 :class="a.usage_data.status === 'rejected' ? 'bg-red-50 text-red-600' : 'bg-amber-50 text-amber-700'">

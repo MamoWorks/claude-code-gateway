@@ -133,7 +133,7 @@ impl AccountService {
         session_hash: &str,
         exclude_ids: &[i64],
         allowed_ids: &[i64],
-        skip_rate_limit_filter: bool,
+        model_class: crate::service::limit::ModelClass,
     ) -> Result<Account, AppError> {
         // 检查粘性会话
         if !session_hash.is_empty() {
@@ -147,11 +147,10 @@ impl AccountService {
                     if let Some(account) = account_opt {
                         let id_allowed =
                             allowed_ids.is_empty() || allowed_ids.contains(&account_id);
-                        let rate_limit_ok = if skip_rate_limit_filter {
-                            self.limit_store.sonnet_available(account_id)
-                        } else {
-                            self.limit_store.availability(account_id).is_available()
-                        };
+                        let rate_limit_ok = self
+                            .limit_store
+                            .availability(account_id, model_class)
+                            .is_available();
                         if account.is_schedulable()
                             && !exclude_ids.contains(&account_id)
                             && id_allowed
@@ -170,9 +169,7 @@ impl AccountService {
         let accounts = self.store.list_schedulable().await?;
         let total_schedulable = accounts.len();
 
-        // 过滤：排除项 + 可用账号限制 + 限流状态（内存热态）
-        // Sonnet 请求旁路：走 Sonnet 专属 ban 检查而非全量 availability，
-        // 让 5h/7d 高利用率 / RPM·TPM 预抢等本地软限流不挡 Sonnet，同时仍能避开刚撞到 Sonnet 429 的账号。
+        // 过滤：排除项 + 可用账号限制 + 限流状态（按 (account, model) 维度）
         let mut limited_out: Vec<i64> = Vec::new();
         let candidates: Vec<Account> = accounts
             .into_iter()
@@ -183,14 +180,7 @@ impl AccountService {
                 if !(allowed_ids.is_empty() || allowed_ids.contains(&a.id)) {
                     return false;
                 }
-                if skip_rate_limit_filter {
-                    if !self.limit_store.sonnet_available(a.id) {
-                        limited_out.push(a.id);
-                        return false;
-                    }
-                    return true;
-                }
-                let availability = self.limit_store.availability(a.id);
+                let availability = self.limit_store.availability(a.id, model_class);
                 if !availability.is_available() {
                     limited_out.push(a.id);
                     return false;

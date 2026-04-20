@@ -26,6 +26,31 @@ const DEFAULT_429_BAN: Duration = Duration::from_secs(60);
 /// SetupToken RPM/TPM 预抢阈值：任一 counter 的 remaining/limit 低于该值即视为预抢。
 const PREEMPT_RATIO: f64 = 0.03;
 
+/// 请求的模型归类。用于按 `(account, model)` 维度维护独立的 `LimitState`。
+/// Sonnet 有自己的限流视图（周子 quota、Sonnet 429 短期 ban）；其它模型（Opus、Haiku 等）归 Opus 桶。
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub enum ModelClass {
+    Opus,
+    Sonnet,
+}
+
+impl ModelClass {
+    pub fn from_model_id(model_id: &str) -> Self {
+        if model_id.to_ascii_lowercase().contains("sonnet") {
+            ModelClass::Sonnet
+        } else {
+            ModelClass::Opus
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Opus => "opus",
+            Self::Sonnet => "sonnet",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnifiedStatus {
     Allowed,
@@ -145,6 +170,7 @@ fn counter_preempted(c: &RpmTpmCounter, now: DateTime<Utc>) -> bool {
 
 #[derive(Debug, Clone, Default)]
 pub struct LimitState {
+    // ---- 账号级（两模型都看）----
     pub five_hour: Option<WindowSnapshot>,
     pub seven_day: Option<WindowSnapshot>,
     pub status: Option<UnifiedStatus>,
@@ -155,19 +181,20 @@ pub struct LimitState {
     pub overage_disabled_reason: Option<String>,
     /// unified-overage-reset 头的时间戳（仅存储，不参与 availability 判定）。
     pub overage_reset_at: Option<DateTime<Utc>>,
-    /// 短期隔离窗口：遇到 429 且无 unified-* 证据时填充（retry-after 或 60s fallback）。
-    /// 不需要 util>=97% 或 status=Rejected，仅凭"本轮撞到 429"即可拉黑一段时间。
+    /// 账号级短期隔离：遇到 429 且 rep_claim 非 Sonnet 子 quota 时填充（retry-after 或 60s fallback）。
+    /// 两模型都受影响。
     pub rate_limited_until: Option<DateTime<Utc>>,
-    /// Sonnet 专属短期隔离：Sonnet 429（`representative_claim=seven_day_sonnet`）时填充。
-    /// 只屏蔽 Sonnet 调度，Opus / 全局 availability 不受影响。
-    pub sonnet_limited_until: Option<DateTime<Utc>>,
-    /// 7 天 Sonnet 子 quota 快照。仅通过 `/api/oauth/usage` 填充（Anthropic 的响应头
-    /// `anthropic-ratelimit-unified-*` 不含 per-model 数据）。UI 展示用。
-    pub sonnet_seven_day: Option<WindowSnapshot>,
-    /// 7 天 Opus 子 quota 快照。同上。
-    pub opus_seven_day: Option<WindowSnapshot>,
     /// SetupToken 账号的 RPM/TPM 四路状态。OAuth 账号一般为 None。
     pub rpm_tpm: Option<RpmTpmSnapshot>,
+
+    // ---- Sonnet overlay（仅 Sonnet 请求看）----
+    /// Sonnet 子 quota 的 7d 窗口（来自 `/api/oauth/usage` 的 `seven_day_sonnet`，
+    /// 或响应头 `representative_claim=seven_day_sonnet` 时的 unified-7d）。
+    pub sonnet_seven_day: Option<WindowSnapshot>,
+    /// Sonnet 专属短期隔离：Sonnet 请求收到 429 + `rep_claim=seven_day_sonnet` 时填充；
+    /// 只阻挡 Sonnet 调度，Opus 不受影响。
+    pub sonnet_rate_limited_until: Option<DateTime<Utc>>,
+
     pub updated_at: Option<Instant>,
     pub last_db_flush_at: Option<Instant>,
 }
@@ -203,24 +230,29 @@ impl LimitStore {
 
     /// 从响应头吸取状态到内存。返回是否应触发 DB flush。
     ///
-    /// 逻辑分支：
-    /// - **有 unified-\* 字段**：走既有路径；若 parsed 的全局 `reset_at` 缺失但有 `retry-after`，
-    ///   用 retry-after 补齐 `rate_limited_until`（保证 availability 有"截止时刻"锚点）。
-    /// - **无 unified-\* 字段 + 429**：CF-layer 或容量问题。
-    ///   `rate_limited_until = now + retry-after`，缺 retry-after 则用 60s 默认值。
-    /// - **无 unified-\* 字段 + 非 429**：空闲响应，不更新内存，返回 false。
-    pub fn absorb_headers(&self, account_id: i64, status: u16, headers: &HeaderMap) -> bool {
+    /// 单账号一份 `LimitState`，但有 Sonnet overlay：
+    /// - 账号级字段（5h、账号 7d、status、rate_limited_until、rpm_tpm）：所有模型的响应都更新，
+    ///   两模型都看。
+    /// - Sonnet overlay（`sonnet_seven_day`、`sonnet_rate_limited_until`）：仅当响应带
+    ///   `representative_claim=seven_day_sonnet` 时写入；只在 Sonnet 调度决策中生效。
+    /// - `representative_claim=seven_day_sonnet` 的 `status=rejected` 被丢弃，避免误拉黑整个账号。
+    pub fn absorb_headers(
+        &self,
+        account_id: i64,
+        model_class: ModelClass,
+        status: u16,
+        headers: &HeaderMap,
+    ) -> bool {
         let mut map = self.states.lock().unwrap();
         let prev = map.get(&account_id).cloned().unwrap_or_default();
 
-        let Some(mut new_state) = compute_new_state(&prev, status, headers) else {
+        let Some(mut new_state) = compute_new_state(&prev, model_class, status, headers) else {
             return false;
         };
         new_state.updated_at = Some(Instant::now());
 
         let flush_r = flush_reason(&prev, &new_state);
         if let Some(reason) = flush_r {
-            // 抢先占位：即使 flush 失败也先记，下次 5min 后再尝试，避免连续失败造成风暴。
             new_state.last_db_flush_at = Some(Instant::now());
             let five = new_state
                 .five_hour
@@ -232,19 +264,28 @@ impl LimitStore {
                 .as_ref()
                 .map(|w| w.utilization)
                 .unwrap_or(0.0);
+            let sonnet_seven = new_state
+                .sonnet_seven_day
+                .as_ref()
+                .map(|w| w.utilization)
+                .unwrap_or(0.0);
             info!(
-                "limit absorb: account {} status={} → flush ({}) 5h={:.1}% 7d={:.1}% status={}",
+                "limit absorb: account {} [{}] status={} → flush ({}) 5h={:.1}% 7d={:.1}% sonnet_7d={:.1}% status={}",
                 account_id,
+                model_class.as_str(),
                 status,
                 reason,
                 five * 100.0,
                 seven * 100.0,
+                sonnet_seven * 100.0,
                 new_state.status.unwrap_or(UnifiedStatus::Allowed).as_str(),
             );
         } else {
             debug!(
-                "limit absorb: account {} status={} → no flush (within TTL, no threshold event)",
-                account_id, status
+                "limit absorb: account {} [{}] status={} → no flush (within TTL, no threshold event)",
+                account_id,
+                model_class.as_str(),
+                status
             );
         }
         let should_flush = flush_r.is_some();
@@ -252,51 +293,33 @@ impl LimitStore {
         should_flush
     }
 
-    /// Selector 用：当前账号可否调度。内存无记录 → 乐观 Available。
-    pub fn availability(&self, account_id: i64) -> Availability {
+    /// Selector 用：判定 `(account, model_class)` 是否可调度。
+    /// 账号级门对两模型一致；Sonnet 额外检查 overlay。
+    pub fn availability(&self, account_id: i64, model_class: ModelClass) -> Availability {
         let map = self.states.lock().unwrap();
-        let Some(state) = map.get(&account_id) else {
-            return Availability::Available;
-        };
-        judge_availability(state)
-    }
-
-    /// Sonnet selector 用：只检查 Sonnet 专属 ban 和全局 Rejected。
-    /// 5h/7d 窗口利用率、RPM/TPM 预抢等本地软限流均不适用于 Sonnet 请求。
-    pub fn sonnet_available(&self, account_id: i64) -> bool {
-        let map = self.states.lock().unwrap();
-        let Some(state) = map.get(&account_id) else {
-            return true;
-        };
-        if let Some(until) = state.sonnet_limited_until {
-            if until > Utc::now() {
-                return false;
-            }
+        match map.get(&account_id) {
+            Some(state) => judge_availability(state, model_class),
+            None => Availability::Available,
         }
-        if state.status == Some(UnifiedStatus::Rejected) {
-            return false;
-        }
-        true
     }
 
     /// flush 当前内存状态到 DB：
+    /// 1. `usage_data` JSON（Opus + Sonnet 两份 state 合并的完整快照，供 UI 读）
+    /// 2. `rate_limit_reset_at` / `rate_limited_at`：取 Opus state 的瓶颈窗口或短期 ban
+    ///    （Sonnet state 的截止时刻只影响 in-memory availability，不落 DB 列）。
+    /// flush 当前内存状态到 DB：
     /// 1. `usage_data` JSON（完整快照，供 UI 读）
-    /// 2. `rate_limit_reset_at` / `rate_limited_at`：
-    ///    任一窗口 util >= 97% 且 resets_at 未来 → 写入最晚的 resets_at；
-    ///    否则清空这两列。
-    ///
-    /// 由 gateway 在 absorb_headers 返回 true 时 tokio::spawn 调用。
+    /// 2. `rate_limit_reset_at` / `rate_limited_at`：取账号级瓶颈窗口或短期 ban。
+    ///    Sonnet overlay 不参与 DB 列（Sonnet 限制不能禁用整个账号）。
     pub async fn flush_to_db(&self, account_id: i64) -> Result<(), AppError> {
         let (json, limit_until) = {
             let map = self.states.lock().unwrap();
-            let Some(state) = map.get(&account_id) else {
+            let Some(state) = map.get(&account_id).cloned() else {
                 debug!("limit flush: account {} not in memory, skip", account_id);
                 return Ok(());
             };
-            // DB 列 rate_limit_reset_at 取"最迟的限流截止时刻"：
-            //   优先 5h/7d 瓶颈窗口；没有瓶颈但存在短期隔离时，退回到 rate_limited_until。
-            let db_reset = bottleneck_limit_until(state).or(state.rate_limited_until);
-            (build_usage_json(state), db_reset)
+            let db_reset = bottleneck_limit_until(&state).or(state.rate_limited_until);
+            (build_usage_json(&state), db_reset)
         };
         let json_str = serde_json::to_string(&json).unwrap_or_else(|_| "{}".into());
         self.store.update_usage(account_id, &json_str).await?;
@@ -317,23 +340,27 @@ impl LimitStore {
         Ok(())
     }
 
-    /// 从 `/api/oauth/usage` JSON（0-100 刻度）同步到内存，保持两条数据源一致。
-    /// 仅用于 Admin 按钮路径。
+    /// 从 `/api/oauth/usage` JSON（0-100 刻度）同步到内存。
+    /// - `five_hour` → `state.five_hour`
+    /// - `seven_day`（聚合）→ `state.seven_day`
+    /// - `seven_day_opus`（若存在，覆盖聚合）→ `state.seven_day`
+    /// - `seven_day_sonnet` → `state.sonnet_seven_day`
     pub fn ingest_usage_json(&self, account_id: i64, usage: &serde_json::Value) {
         let mut map = self.states.lock().unwrap();
         let mut state = map.get(&account_id).cloned().unwrap_or_default();
-
         if let Some(w) = parse_usage_json_window(usage, "five_hour") {
             state.five_hour = Some(w);
         }
         if let Some(w) = parse_usage_json_window(usage, "seven_day") {
             state.seven_day = Some(w);
         }
+        if let Some(w) = parse_usage_json_window(usage, "seven_day_opus") {
+            // seven_day_opus 是 Anthropic 细分的 Opus 子 quota；用户确认实际上不独立 enforce，
+            // 和聚合 `seven_day` 同义。若存在以它为准覆盖。
+            state.seven_day = Some(w);
+        }
         if let Some(w) = parse_usage_json_window(usage, "seven_day_sonnet") {
             state.sonnet_seven_day = Some(w);
-        }
-        if let Some(w) = parse_usage_json_window(usage, "seven_day_opus") {
-            state.opus_seven_day = Some(w);
         }
         state.updated_at = Some(Instant::now());
         map.insert(account_id, state);
@@ -346,56 +373,62 @@ impl LimitStore {
 ///
 /// 返回 `None` 表示本次响应无可吸取信息（保持内存原样）；
 /// 返回 `Some(new_state)` 表示调用者应把内存替换为该状态。
-fn compute_new_state(prev: &LimitState, status: u16, headers: &HeaderMap) -> Option<LimitState> {
-    let is_sonnet_429 = status == 429 && is_sonnet_rejection(headers);
-    let parsed_unified = parse_unified_headers(headers).map(|mut p| {
-        // Sonnet 旁路：429 + representative-claim=seven_day_sonnet 时，
-        // 不把全局 status=Rejected 写入内存热态。这样 judge_availability 不会拉黑账号，
-        // 保留账号对 Opus / 5h/7d 聚合等其它模型/窗口的调度能力。
-        // 其它字段（5h/7d util、reset、claim、overage）继续吸收，UI/日志仍完整。
-        if is_sonnet_429 {
-            p.status = None;
-        }
-        p
-    });
+///
+/// 按 `representative_claim` 路由：
+/// - `Some("seven_day_sonnet")`：7d 数据与 429 短期 ban 都写入 Sonnet overlay；`status` 丢弃，
+///   避免误拉黑整个账号。
+/// - 其它 rep_claim（含 None、`5h`、`seven_day` 等）：按账号级字段写入；`status`、
+///   `rate_limited_until` 都影响两模型。
+fn compute_new_state(
+    prev: &LimitState,
+    model_class: ModelClass,
+    status: u16,
+    headers: &HeaderMap,
+) -> Option<LimitState> {
+    let parsed_unified = parse_unified_headers(headers);
     let parsed_rpm_tpm = parse_rpm_tpm_headers(headers);
     let retry_after = parse_retry_after(headers);
 
-    // 只要有 unified-* 或 RPM/TPM 任一头可用，就吸取；两者可共存（OAuth 账号理论上也可能收到 RPM/TPM）。
     if parsed_unified.is_some() || parsed_rpm_tpm.is_some() {
         let mut s = prev.clone();
+        let is_sonnet_claim = parsed_unified
+            .as_ref()
+            .and_then(|p| p.representative_claim.as_deref())
+            == Some("seven_day_sonnet");
+
         if let Some(u) = parsed_unified {
             s = apply_parsed(s, u);
         }
         if let Some(r) = parsed_rpm_tpm {
             s.rpm_tpm = Some(merge_rpm_tpm(s.rpm_tpm.take(), r));
         }
-        // 若 429 时全局 reset 缺失，用 retry-after 补一个短期 ban 兜底。
+
+        // 429 + retry-after 的短期 ban 兜底：若 rep_claim 是 Sonnet 子 quota，只写 Sonnet overlay
+        // （不封 Opus）；否则写账号级。
         if status == 429 && s.reset_at.is_none() {
             if let Some(ra) = retry_after {
-                s.rate_limited_until =
-                    Some(Utc::now() + chrono::Duration::from_std(ra).unwrap_or_default());
+                let until = Utc::now() + chrono::Duration::from_std(ra).unwrap_or_default();
+                if is_sonnet_claim && matches!(model_class, ModelClass::Sonnet) {
+                    s.sonnet_rate_limited_until = Some(until);
+                } else {
+                    s.rate_limited_until = Some(until);
+                }
             }
-        }
-        // Sonnet 专属短期隔离：优先用 retry-after，其次用 7d window reset，最后 1h 兜底。
-        if is_sonnet_429 {
-            let ban_end = retry_after
-                .map(|d| Utc::now() + chrono::Duration::from_std(d).unwrap_or_default())
-                .or_else(|| s.seven_day.as_ref().map(|w| w.resets_at))
-                .unwrap_or_else(|| Utc::now() + chrono::Duration::hours(1));
-            s.sonnet_limited_until = Some(ban_end);
         }
         return Some(s);
     }
 
     if status == 429 {
-        // CF-layer 429：没有任何 unified-* / RPM/TPM 头，仅设短期 ban。
+        // CF-layer 429：无任何 unified-* / RPM/TPM 头，仅设短期 ban。Sonnet 请求撞 CF-layer 时
+        // 也只影响 Sonnet overlay，因为 CF 层和 Anthropic 的模型无关，本来就不该封整个账号。
+        // 但保守起见：Sonnet 请求 → sonnet_rate_limited_until；其他 → 账号级。
         let mut s = prev.clone();
         let ban = retry_after.unwrap_or(DEFAULT_429_BAN);
         let ban_until = Utc::now() + chrono::Duration::from_std(ban).unwrap_or_default();
-        s.rate_limited_until = Some(ban_until);
-        if is_sonnet_429 {
-            s.sonnet_limited_until = Some(ban_until);
+        if matches!(model_class, ModelClass::Sonnet) {
+            s.sonnet_rate_limited_until = Some(ban_until);
+        } else {
+            s.rate_limited_until = Some(ban_until);
         }
         return Some(s);
     }
@@ -591,17 +624,13 @@ fn parse_usage_json_window(usage: &serde_json::Value, key: &str) -> Option<Windo
 }
 
 fn apply_parsed(mut state: LimitState, parsed: ParsedHeaders) -> LimitState {
+    // 5h 无条件吸收（账号级，客观事实）
     if let Some(w) = parsed.five_hour {
         state.five_hour = Some(w);
     }
-    if let Some(w) = parsed.seven_day {
-        state.seven_day = Some(w);
-    }
-    if let Some(s) = parsed.status {
-        state.status = Some(s);
-    }
-    if let Some(c) = parsed.representative_claim {
-        state.representative_claim = Some(c);
+    // overage / rep_claim / reset_at / fallback 无条件吸收（展示字段）
+    if let Some(c) = &parsed.representative_claim {
+        state.representative_claim = Some(c.clone());
     }
     if let Some(r) = parsed.reset_at {
         state.reset_at = Some(r);
@@ -617,6 +646,24 @@ fn apply_parsed(mut state: LimitState, parsed: ParsedHeaders) -> LimitState {
     }
     if let Some(r) = parsed.overage_reset_at {
         state.overage_reset_at = Some(r);
+    }
+    // 7d 与 status 按 rep_claim 分路：
+    // - rep_claim == "seven_day_sonnet"：Sonnet 子 quota 已触顶；只写 Sonnet overlay，
+    //   status 丢弃（不禁用整个账号，Opus 仍可用）。
+    // - 其它：写账号级 seven_day + status，影响两模型。
+    let is_sonnet_claim = parsed.representative_claim.as_deref() == Some("seven_day_sonnet");
+    if is_sonnet_claim {
+        if let Some(w) = parsed.seven_day {
+            state.sonnet_seven_day = Some(w);
+        }
+        // parsed.status 有意丢弃
+    } else {
+        if let Some(w) = parsed.seven_day {
+            state.seven_day = Some(w);
+        }
+        if let Some(s) = parsed.status {
+            state.status = Some(s);
+        }
     }
     state
 }
@@ -639,21 +686,26 @@ fn flush_reason(prev: &LimitState, new: &LimitState) -> Option<&'static str> {
     if prev_status == UnifiedStatus::Allowed && new_status != UnifiedStatus::Allowed {
         return Some("status-changed");
     }
-    // 4) 任一窗口 utilization 跨过 97%
+    // 4) 任一窗口 utilization 跨过 97%（含 Sonnet overlay）
     if crossed_threshold(&prev.five_hour, &new.five_hour, HIT_THRESHOLD)
         || crossed_threshold(&prev.seven_day, &new.seven_day, HIT_THRESHOLD)
+        || crossed_threshold(&prev.sonnet_seven_day, &new.sonnet_seven_day, HIT_THRESHOLD)
     {
         return Some("threshold-crossed-97pct");
     }
     // 5) 任一窗口新出现 surpassed-threshold 头
     if newly_surpassed(&prev.five_hour, &new.five_hour)
         || newly_surpassed(&prev.seven_day, &new.seven_day)
+        || newly_surpassed(&prev.sonnet_seven_day, &new.sonnet_seven_day)
     {
         return Some("surpassed-threshold");
     }
-    // 6) 新进入短期隔离（CF 429 或 Anthropic 429 无 reset）
+    // 6) 新进入短期隔离（CF 429 或 Anthropic 429 无 reset；含 Sonnet overlay）
     if prev.rate_limited_until.is_none() && new.rate_limited_until.is_some() {
         return Some("429-short-ban");
+    }
+    if prev.sonnet_rate_limited_until.is_none() && new.sonnet_rate_limited_until.is_some() {
+        return Some("429-short-ban-sonnet");
     }
     // 7) RPM/TPM 任一 counter 从"充裕"变"预抢"
     if rpm_tpm_newly_preempted(&prev.rpm_tpm, &new.rpm_tpm) {
@@ -710,8 +762,14 @@ fn bottleneck_limit_until(state: &LimitState) -> Option<DateTime<Utc>> {
     picks.into_iter().max()
 }
 
-fn judge_availability(state: &LimitState) -> Availability {
-    // 短期隔离优先判定：遇到过 429（无论 CF-layer 还是 Anthropic 无 reset 的 fallback）
+fn judge_availability(state: &LimitState, model_class: ModelClass) -> Availability {
+    // ---- 账号级门（对两模型一致）----
+    if state.status == Some(UnifiedStatus::Rejected) {
+        return Availability::Unavailable {
+            reason: "上游已拒绝（status=rejected）".into(),
+            until: state.reset_at,
+        };
+    }
     if let Some(until) = state.rate_limited_until {
         if until > Utc::now() {
             return Availability::Unavailable {
@@ -720,7 +778,6 @@ fn judge_availability(state: &LimitState) -> Availability {
             };
         }
     }
-    // SetupToken RPM/TPM 预抢
     if let Some(rt) = &state.rpm_tpm {
         if let Some((name, until)) = rt.first_preempted(Utc::now()) {
             return Availability::Unavailable {
@@ -745,17 +802,36 @@ fn judge_availability(state: &LimitState) -> Availability {
             };
         }
     }
-    // 全局 status = Rejected → 不可用
-    if state.status == Some(UnifiedStatus::Rejected) {
-        return Availability::Unavailable {
-            reason: "上游已拒绝（status=rejected）".into(),
-            until: state.reset_at,
-        };
+    // ---- Sonnet overlay：仅 Sonnet 请求额外检查 ----
+    if matches!(model_class, ModelClass::Sonnet) {
+        if let Some(until) = state.sonnet_rate_limited_until {
+            if until > Utc::now() {
+                return Availability::Unavailable {
+                    reason: "Sonnet 429 短期隔离".into(),
+                    until: Some(until),
+                };
+            }
+        }
+        if let Some(w) = &state.sonnet_seven_day {
+            if w.utilization >= HIT_THRESHOLD && w.resets_at > Utc::now() {
+                return Availability::Unavailable {
+                    reason: format!("Sonnet 7 天已用 {:.1}%", w.utilization * 100.0),
+                    until: Some(w.resets_at),
+                };
+            }
+        }
     }
     Availability::Available
 }
 
 /// 构造前端兼容的 `usage_data` JSON（utilization 乘 100 转 0-100 刻度）。
+///
+/// 字段：
+/// - 账号级：`five_hour`、`seven_day`、`status`、`representative_claim`、`resets_at`、
+///   `overage_*`、`rate_limited_until`、`rpm_tpm`
+/// - Sonnet overlay：`seven_day_sonnet`（= `state.sonnet_seven_day`）、
+///   `sonnet_rate_limited_until`（= `state.sonnet_rate_limited_until`）
+/// - 兼容 mirror：`seven_day_opus` = `seven_day`（前端老版本读取）
 fn build_usage_json(state: &LimitState) -> serde_json::Value {
     let mut obj = serde_json::Map::new();
     if let Some(w) = &state.five_hour {
@@ -763,18 +839,19 @@ fn build_usage_json(state: &LimitState) -> serde_json::Value {
     }
     if let Some(w) = &state.seven_day {
         obj.insert("seven_day".into(), window_to_json(w));
+        obj.insert("seven_day_opus".into(), window_to_json(w));
     }
     if let Some(w) = &state.sonnet_seven_day {
         obj.insert("seven_day_sonnet".into(), window_to_json(w));
-    }
-    if let Some(w) = &state.opus_seven_day {
-        obj.insert("seven_day_opus".into(), window_to_json(w));
     }
     if let Some(s) = state.status {
         obj.insert("status".into(), serde_json::Value::from(s.as_str()));
     }
     if let Some(c) = &state.representative_claim {
-        obj.insert("representative_claim".into(), serde_json::Value::from(c.clone()));
+        obj.insert(
+            "representative_claim".into(),
+            serde_json::Value::from(c.clone()),
+        );
     }
     if let Some(r) = state.reset_at {
         obj.insert("resets_at".into(), serde_json::Value::from(r.to_rfc3339()));
@@ -803,6 +880,12 @@ fn build_usage_json(state: &LimitState) -> serde_json::Value {
     if let Some(until) = state.rate_limited_until {
         obj.insert(
             "rate_limited_until".into(),
+            serde_json::Value::from(until.to_rfc3339()),
+        );
+    }
+    if let Some(until) = state.sonnet_rate_limited_until {
+        obj.insert(
+            "sonnet_rate_limited_until".into(),
             serde_json::Value::from(until.to_rfc3339()),
         );
     }
@@ -1004,7 +1087,7 @@ mod tests {
     #[test]
     fn availability_empty_is_available() {
         let state = LimitState::default();
-        assert!(judge_availability(&state).is_available());
+        assert!(judge_availability(&state, ModelClass::Opus).is_available());
     }
 
     #[test]
@@ -1019,7 +1102,7 @@ mod tests {
             status: Some(UnifiedStatus::Allowed),
             ..Default::default()
         };
-        assert!(judge_availability(&state).is_available());
+        assert!(judge_availability(&state, ModelClass::Opus).is_available());
     }
 
     #[test]
@@ -1033,7 +1116,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        match judge_availability(&state) {
+        match judge_availability(&state, ModelClass::Opus) {
             Availability::Unavailable { until, .. } => assert!(until.is_some()),
             Availability::Available => panic!("should be unavailable"),
         }
@@ -1045,7 +1128,7 @@ mod tests {
             status: Some(UnifiedStatus::Rejected),
             ..Default::default()
         };
-        assert!(!judge_availability(&state).is_available());
+        assert!(!judge_availability(&state, ModelClass::Opus).is_available());
     }
 
     #[test]
@@ -1060,7 +1143,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(judge_availability(&state).is_available());
+        assert!(judge_availability(&state, ModelClass::Opus).is_available());
     }
 
     // ---- bottleneck_limit_until ----
@@ -1171,13 +1254,13 @@ mod tests {
     fn absorb_429_cf_without_headers_sets_60s_ban() {
         let h = make_headers(&[("content-type", "text/html")]);
         let prev = LimitState::default();
-        let new = compute_new_state(&prev, 429, &h).expect("should produce state");
+        let new = compute_new_state(&prev, ModelClass::Opus, 429, &h).expect("should produce state");
         let until = new.rate_limited_until.expect("rate_limited_until set");
         let expected = Utc::now() + chrono::Duration::seconds(60);
         // 允许 2 秒误差（测试机 clock 漂移）
         let diff = (until - expected).num_seconds().abs();
         assert!(diff <= 2, "expected ~60s ban, got diff={}s", diff);
-        assert!(!judge_availability(&new).is_available());
+        assert!(!judge_availability(&new, ModelClass::Opus).is_available());
     }
 
     /// CF-layer 429 但带 retry-after：应用 retry-after 数值，忽略默认 60s。
@@ -1185,7 +1268,7 @@ mod tests {
     fn absorb_429_cf_with_retry_after_uses_it() {
         let h = make_headers(&[("retry-after", "120")]);
         let prev = LimitState::default();
-        let new = compute_new_state(&prev, 429, &h).expect("should produce state");
+        let new = compute_new_state(&prev, ModelClass::Opus, 429, &h).expect("should produce state");
         let until = new.rate_limited_until.expect("rate_limited_until set");
         let expected = Utc::now() + chrono::Duration::seconds(120);
         let diff = (until - expected).num_seconds().abs();
@@ -1205,7 +1288,7 @@ mod tests {
             ("retry-after", "300"),
         ]);
         let prev = LimitState::default();
-        let new = compute_new_state(&prev, 429, &h).expect("should produce state");
+        let new = compute_new_state(&prev, ModelClass::Opus, 429, &h).expect("should produce state");
         // 5h 窗口应被正常吸收
         assert!(new.five_hour.is_some());
         assert_eq!(new.status, Some(UnifiedStatus::Rejected));
@@ -1232,11 +1315,11 @@ mod tests {
             ("anthropic-ratelimit-unified-reset", &reset_ts.to_string()),
         ]);
         let prev = LimitState::default();
-        let new = compute_new_state(&prev, 429, &h).expect("should produce state");
+        let new = compute_new_state(&prev, ModelClass::Opus, 429, &h).expect("should produce state");
         assert!(new.rate_limited_until.is_none(), "不应走 fallback 路径");
         assert_eq!(new.status, Some(UnifiedStatus::Rejected));
         // availability 应判 Unavailable（5h 97%）
-        assert!(!judge_availability(&new).is_available());
+        assert!(!judge_availability(&new, ModelClass::Opus).is_available());
     }
 
     /// 200 响应且无 unified-* 头：不应触发任何更新（Phase 2 回归）。
@@ -1244,7 +1327,7 @@ mod tests {
     fn absorb_200_without_headers_does_nothing() {
         let h = make_headers(&[("content-type", "text/event-stream")]);
         let prev = LimitState::default();
-        assert!(compute_new_state(&prev, 200, &h).is_none());
+        assert!(compute_new_state(&prev, ModelClass::Opus, 200, &h).is_none());
     }
 
     /// availability 直接尊重 rate_limited_until，即使没有 5h/7d/status 证据。
@@ -1254,7 +1337,7 @@ mod tests {
             rate_limited_until: Some(Utc::now() + chrono::Duration::seconds(30)),
             ..Default::default()
         };
-        match judge_availability(&state) {
+        match judge_availability(&state, ModelClass::Opus) {
             Availability::Unavailable { until, .. } => assert!(until.is_some()),
             Availability::Available => panic!("应 Unavailable"),
         }
@@ -1267,7 +1350,7 @@ mod tests {
             rate_limited_until: Some(Utc::now() - chrono::Duration::seconds(1)),
             ..Default::default()
         };
-        assert!(judge_availability(&state).is_available());
+        assert!(judge_availability(&state, ModelClass::Opus).is_available());
     }
 
     /// 首次进入短期隔离应触发 flush（first-fill 覆盖更广，但短期隔离场景值得单测）。
@@ -1404,7 +1487,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let a = judge_availability(&state);
+        let a = judge_availability(&state, ModelClass::Opus);
         assert!(!a.is_available(), "remaining=1/50 应预抢");
         match a {
             Availability::Unavailable { until, reason } => {
@@ -1425,7 +1508,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(judge_availability(&state).is_available());
+        assert!(judge_availability(&state, ModelClass::Opus).is_available());
     }
 
     #[test]
@@ -1439,7 +1522,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        match judge_availability(&state) {
+        match judge_availability(&state, ModelClass::Opus) {
             Availability::Unavailable { reason, .. } => assert!(reason.contains("tokens")),
             _ => panic!("should be unavailable"),
         }
@@ -1513,7 +1596,7 @@ mod tests {
     fn absorb_200_with_rpm_tpm_updates_state() {
         let h = headers_from(rpm_tpm_full_headers());
         let prev = LimitState::default();
-        let new = compute_new_state(&prev, 200, &h).expect("should produce state");
+        let new = compute_new_state(&prev, ModelClass::Opus, 200, &h).expect("should produce state");
         assert!(new.rpm_tpm.is_some());
         let rt = new.rpm_tpm.unwrap();
         assert_eq!(rt.requests.unwrap().limit, 50);
@@ -1531,7 +1614,7 @@ mod tests {
         ]);
         let h = headers_from(headers);
         let prev = LimitState::default();
-        let new = compute_new_state(&prev, 200, &h).expect("should produce state");
+        let new = compute_new_state(&prev, ModelClass::Opus, 200, &h).expect("should produce state");
         assert!(new.five_hour.is_some(), "unified 路径应被吸收");
         assert!(new.rpm_tpm.is_some(), "RPM/TPM 路径应被吸收");
     }
@@ -1558,15 +1641,21 @@ mod tests {
         (Utc::now().timestamp() + 3600).to_string()
     }
 
-    /// 429 + representative-claim=seven_day_sonnet → status 不应被设为 Rejected，
-    /// 账号 availability 保持 Available（不影响 Opus 调度）。
+    /// v4：响应带 rep_claim=seven_day_sonnet 时
+    /// - status 丢弃（不误拉黑整个账号；Opus 仍可调度）
+    /// - 7d 数据路由到 `sonnet_seven_day`（不污染账号级 seven_day）
+    /// - 5h 仍按账号级吸收（Anthropic 的 5h 窗口是账号事实）
+    /// - Sonnet 请求的 429 retry-after → `sonnet_rate_limited_until`
     #[test]
-    fn absorb_429_sonnet_claim_does_not_set_rejected() {
+    fn absorb_429_sonnet_claim_routes_to_sonnet_overlay() {
         let r = reset_future_unix();
         let h = make_headers(&[
             ("anthropic-ratelimit-unified-5h-reset", &r),
-            ("anthropic-ratelimit-unified-5h-status", "rejected"),
+            ("anthropic-ratelimit-unified-5h-status", "allowed"),
             ("anthropic-ratelimit-unified-5h-utilization", "0.50"),
+            ("anthropic-ratelimit-unified-7d-reset", &r),
+            ("anthropic-ratelimit-unified-7d-status", "rejected"),
+            ("anthropic-ratelimit-unified-7d-utilization", "1.0"),
             ("anthropic-ratelimit-unified-status", "rejected"),
             ("anthropic-ratelimit-unified-reset", &r),
             (
@@ -1575,13 +1664,19 @@ mod tests {
             ),
         ]);
         let prev = LimitState::default();
-        let new = compute_new_state(&prev, 429, &h).expect("should produce state");
-        // 关键：全局 status 不应被设为 Rejected
-        assert_ne!(new.status, Some(UnifiedStatus::Rejected));
-        // representative_claim 仍被吸收（UI 要用）
+        let new = compute_new_state(&prev, ModelClass::Sonnet, 429, &h).expect("should produce state");
+        // status 丢弃 —— 不禁用账号
+        assert_eq!(new.status, None, "rep_claim=seven_day_sonnet 时 status 必须丢弃");
+        // 7d 走 Sonnet overlay
+        assert!(new.sonnet_seven_day.is_some(), "7d 数据路由到 sonnet_seven_day");
+        assert!(new.seven_day.is_none(), "账号级 seven_day 不被污染");
+        // 5h 仍按账号级吸收
+        assert!(new.five_hour.is_some(), "5h 是账号级事实，Sonnet 也必须吸收");
+        // representative_claim 吸收（UI 展示用）
         assert_eq!(new.representative_claim.as_deref(), Some("seven_day_sonnet"));
-        // availability 保持 Available（5h util 0.50 远低于 97%，无其它拉黑条件）
-        assert!(judge_availability(&new).is_available());
+        // availability：Opus 不受影响；Sonnet 因 sonnet_seven_day=100% 被拦
+        assert!(judge_availability(&new, ModelClass::Opus).is_available());
+        assert!(!judge_availability(&new, ModelClass::Sonnet).is_available());
     }
 
     /// 429 + representative-claim=seven_day_opus → 保持既有拉黑行为（Opus 覆盖所有 Opus 请求）。
@@ -1597,9 +1692,9 @@ mod tests {
             ),
         ]);
         let prev = LimitState::default();
-        let new = compute_new_state(&prev, 429, &h).expect("should produce state");
+        let new = compute_new_state(&prev, ModelClass::Opus, 429, &h).expect("should produce state");
         assert_eq!(new.status, Some(UnifiedStatus::Rejected));
-        assert!(!judge_availability(&new).is_available());
+        assert!(!judge_availability(&new, ModelClass::Opus).is_available());
     }
 
     /// 429 + representative-claim=seven_day（聚合周）→ 保持既有拉黑。
@@ -1614,9 +1709,9 @@ mod tests {
                 "seven_day",
             ),
         ]);
-        let new = compute_new_state(&LimitState::default(), 429, &h).expect("state");
+        let new = compute_new_state(&LimitState::default(), ModelClass::Opus, 429, &h).expect("state");
         assert_eq!(new.status, Some(UnifiedStatus::Rejected));
-        assert!(!judge_availability(&new).is_available());
+        assert!(!judge_availability(&new, ModelClass::Opus).is_available());
     }
 
     /// 429 + representative-claim=five_hour → 保持既有拉黑。
@@ -1631,15 +1726,16 @@ mod tests {
                 "five_hour",
             ),
         ]);
-        let new = compute_new_state(&LimitState::default(), 429, &h).expect("state");
+        let new = compute_new_state(&LimitState::default(), ModelClass::Opus, 429, &h).expect("state");
         assert_eq!(new.status, Some(UnifiedStatus::Rejected));
-        assert!(!judge_availability(&new).is_available());
+        assert!(!judge_availability(&new, ModelClass::Opus).is_available());
     }
 
-    /// 200 + representative-claim=seven_day_sonnet（正常响应含 Sonnet hint）→ 不触发旁路。
-    /// 该场景下 status=Allowed/Warning 本就不会拉黑，但确认我们没有错误地把 status 清成 None。
+    /// v4：200 + rep_claim=seven_day_sonnet（Sonnet 子 quota 仅是 hint，非拒绝）→
+    /// status 仍被丢弃（为了一致性：rep_claim=seven_day_sonnet 永不写 status）。
+    /// 但 5h、7d 数据仍正确吸收。
     #[test]
-    fn absorb_200_sonnet_claim_keeps_status_allowed() {
+    fn absorb_200_sonnet_claim_discards_status_for_consistency() {
         let h = make_headers(&[
             ("anthropic-ratelimit-unified-status", "allowed_warning"),
             (
@@ -1647,9 +1743,9 @@ mod tests {
                 "seven_day_sonnet",
             ),
         ]);
-        let new = compute_new_state(&LimitState::default(), 200, &h).expect("state");
-        // 200 不触发旁路；status 正常吸收
-        assert_eq!(new.status, Some(UnifiedStatus::AllowedWarning));
+        let new = compute_new_state(&LimitState::default(), ModelClass::Sonnet, 200, &h).expect("state");
+        assert_eq!(new.status, None, "rep_claim=seven_day_sonnet → status 丢弃");
+        assert_eq!(new.representative_claim.as_deref(), Some("seven_day_sonnet"));
     }
 
     #[test]
@@ -1672,5 +1768,116 @@ mod tests {
         }
         let h_empty = make_headers(&[]);
         assert!(!is_sonnet_rejection(&h_empty));
+    }
+
+    // ---- v4 新增：单 state + Sonnet overlay 的语义测试 ----
+
+    fn mk_window(util: f64) -> WindowSnapshot {
+        WindowSnapshot {
+            utilization: util,
+            resets_at: Utc::now() + chrono::Duration::hours(1),
+            status: UnifiedStatus::Allowed,
+            surpassed_threshold: None,
+        }
+    }
+
+    /// 账号级 5h ≥ 97% → Opus 和 Sonnet 都不可调度。
+    #[test]
+    fn five_hour_97pct_blocks_both_models() {
+        let state = LimitState {
+            five_hour: Some(mk_window(0.98)),
+            ..Default::default()
+        };
+        assert!(!judge_availability(&state, ModelClass::Opus).is_available());
+        assert!(!judge_availability(&state, ModelClass::Sonnet).is_available());
+    }
+
+    /// 账号级 7d ≥ 97% → Opus 和 Sonnet 都不可调度。
+    #[test]
+    fn account_seven_day_97pct_blocks_both_models() {
+        let state = LimitState {
+            seven_day: Some(mk_window(0.98)),
+            ..Default::default()
+        };
+        assert!(!judge_availability(&state, ModelClass::Opus).is_available());
+        assert!(!judge_availability(&state, ModelClass::Sonnet).is_available());
+    }
+
+    /// Sonnet overlay 7d ≥ 97% → 只挡 Sonnet，Opus 仍可调度。
+    #[test]
+    fn sonnet_seven_day_97pct_blocks_only_sonnet() {
+        let state = LimitState {
+            sonnet_seven_day: Some(mk_window(0.98)),
+            ..Default::default()
+        };
+        assert!(judge_availability(&state, ModelClass::Opus).is_available());
+        assert!(!judge_availability(&state, ModelClass::Sonnet).is_available());
+    }
+
+    /// Sonnet 专属短期 ban → 只挡 Sonnet，Opus 不受影响。
+    #[test]
+    fn sonnet_rate_limited_until_blocks_only_sonnet() {
+        let state = LimitState {
+            sonnet_rate_limited_until: Some(Utc::now() + chrono::Duration::seconds(60)),
+            ..Default::default()
+        };
+        assert!(judge_availability(&state, ModelClass::Opus).is_available());
+        assert!(!judge_availability(&state, ModelClass::Sonnet).is_available());
+    }
+
+    /// 账号级 rate_limited_until → 两模型都挡。
+    #[test]
+    fn account_rate_limited_until_blocks_both_models() {
+        let state = LimitState {
+            rate_limited_until: Some(Utc::now() + chrono::Duration::seconds(60)),
+            ..Default::default()
+        };
+        assert!(!judge_availability(&state, ModelClass::Opus).is_available());
+        assert!(!judge_availability(&state, ModelClass::Sonnet).is_available());
+    }
+
+    /// Sonnet 请求 429 + rep_claim=seven_day_sonnet + retry-after
+    /// → 写入 sonnet_rate_limited_until，不写账号级 rate_limited_until。
+    #[test]
+    fn sonnet_429_seven_day_sonnet_sets_only_sonnet_rate_limited_until() {
+        let h = make_headers(&[
+            (
+                "anthropic-ratelimit-unified-representative-claim",
+                "seven_day_sonnet",
+            ),
+            ("retry-after", "30"),
+        ]);
+        let new = compute_new_state(&LimitState::default(), ModelClass::Sonnet, 429, &h)
+            .expect("state");
+        assert!(new.sonnet_rate_limited_until.is_some(), "Sonnet overlay 应设置");
+        assert!(new.rate_limited_until.is_none(), "账号级不应被污染");
+    }
+
+    /// Opus 请求 429 + rep_claim=five_hour + retry-after
+    /// → 写入账号级 rate_limited_until（两模型都封）。
+    #[test]
+    fn opus_429_five_hour_sets_account_rate_limited_until() {
+        let h = make_headers(&[
+            (
+                "anthropic-ratelimit-unified-representative-claim",
+                "five_hour",
+            ),
+            ("retry-after", "30"),
+        ]);
+        let new = compute_new_state(&LimitState::default(), ModelClass::Opus, 429, &h)
+            .expect("state");
+        assert!(new.rate_limited_until.is_some());
+        assert!(new.sonnet_rate_limited_until.is_none());
+    }
+
+    /// 账号级 status=Rejected（rep_claim=five_hour 或 seven_day）→ 两模型都封。
+    #[test]
+    fn account_level_status_rejected_blocks_both_models() {
+        let state = LimitState {
+            status: Some(UnifiedStatus::Rejected),
+            ..Default::default()
+        };
+        assert!(!judge_availability(&state, ModelClass::Opus).is_available());
+        assert!(!judge_availability(&state, ModelClass::Sonnet).is_available());
     }
 }
